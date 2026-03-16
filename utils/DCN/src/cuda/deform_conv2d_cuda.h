@@ -33,7 +33,7 @@ deform_conv2d_forward(const at::Tensor &input,
                                    pad_h, pad_w,
                                    dilation_h, dilation_w,
                                    group,
-                                   deformable_group, 
+                                   deformable_group,
                                    im2col_step);
 #else
         AT_ERROR("Not compiled with GPU support");

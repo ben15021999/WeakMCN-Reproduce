@@ -9,12 +9,16 @@ from torch import nn
 from torch.autograd import Function
 from torch.nn.modules.utils import _pair
 from torch.autograd.function import once_differentiable
-from apex import amp
+# from apex import amp
+from torch.cuda.amp import custom_fwd, custom_bwd
+
 import DCN
+
 
 class DeformConv2dFunction(Function):
     @staticmethod
-    @amp.float_function
+    # @amp.float_function
+    @custom_fwd(cast_inputs=torch.float32, device_type='cuda')
     def forward(ctx, input, offset, weight, bias,
                 stride, padding, dilation, group, deformable_groups, im2col_step):
         ctx.stride = _pair(stride)
@@ -25,34 +29,35 @@ class DeformConv2dFunction(Function):
         ctx.deformable_groups = deformable_groups
         ctx.im2col_step = im2col_step
         output = DCN.deform_conv2d_forward(input, weight, bias,
-                                         offset,
-                                         ctx.kernel_size[0], ctx.kernel_size[1],
-                                         ctx.stride[0], ctx.stride[1],
-                                         ctx.padding[0], ctx.padding[1],
-                                         ctx.dilation[0], ctx.dilation[1],
-                                         ctx.group,
-                                         ctx.deformable_groups,
-                                         ctx.im2col_step)
+                                           offset,
+                                           ctx.kernel_size[0], ctx.kernel_size[1],
+                                           ctx.stride[0], ctx.stride[1],
+                                           ctx.padding[0], ctx.padding[1],
+                                           ctx.dilation[0], ctx.dilation[1],
+                                           ctx.group,
+                                           ctx.deformable_groups,
+                                           ctx.im2col_step)
         ctx.save_for_backward(input, offset, weight, bias)
         return output
 
     @staticmethod
     @once_differentiable
-    @amp.float_function
+    # @amp.float_function
+    @custom_fwd(cast_inputs=torch.float32, device_type='cuda')
     def backward(ctx, grad_output):
         input, offset, weight, bias = ctx.saved_tensors
         grad_input, grad_offset, grad_weight, grad_bias = \
             DCN.deform_conv2d_backward(input, weight,
-                                     bias,
-                                     offset,
-                                     grad_output,
-                                     ctx.kernel_size[0], ctx.kernel_size[1],
-                                     ctx.stride[0], ctx.stride[1],
-                                     ctx.padding[0], ctx.padding[1],
-                                     ctx.dilation[0], ctx.dilation[1],
-                                     ctx.group,
-                                     ctx.deformable_groups,
-                                     ctx.im2col_step)
+                                       bias,
+                                       offset,
+                                       grad_output,
+                                       ctx.kernel_size[0], ctx.kernel_size[1],
+                                       ctx.stride[0], ctx.stride[1],
+                                       ctx.padding[0], ctx.padding[1],
+                                       ctx.dilation[0], ctx.dilation[1],
+                                       ctx.group,
+                                       ctx.deformable_groups,
+                                       ctx.im2col_step)
 
-        return grad_input, grad_offset, grad_weight, grad_bias,\
+        return grad_input, grad_offset, grad_weight, grad_bias, \
             None, None, None, None, None, None

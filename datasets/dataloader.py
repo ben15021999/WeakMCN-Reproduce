@@ -1,8 +1,6 @@
-# coding=utf-8
-
 import os
 import cv2
-import json, re, en_vectors_web_lg, random
+import json, re, spacy, random
 
 import numpy as np
 
@@ -12,7 +10,6 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import transforms
 
 from utils.utils import label2yolobox
-
 
 class RefCOCODataSet(Data.Dataset):
     def __init__(self, __C, split):
@@ -69,7 +66,7 @@ class RefCOCODataSet(Data.Dataset):
         spacy_tool = None
         pretrained_emb = []
         if use_glove:
-            spacy_tool = en_vectors_web_lg.load()
+            spacy_tool = spacy.load("en_core_web_lg")
             pretrained_emb.append(spacy_tool('PAD').vector)
             pretrained_emb.append(spacy_tool('UNK').vector)
             pretrained_emb.append(spacy_tool('CLS').vector)
