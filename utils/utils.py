@@ -274,13 +274,33 @@ def yolobox2label(box, info_img):
     # y1 = ((y1 - dy) / nh) * h
     # x1 = ((x1 - dx) / nw) * w
     # label = [y1, x1, y1 + box_h, x1 + box_w]
+    # h, w, nh, nw, dx, dy, _ = info_img
+    # x1, y1, x2, y2 = box[:4]
+    # box_h = ((y2 - y1) / nh) * h
+    # box_w = ((x2 - x1) / nw) * w
+    # y1 = ((y1 - dy) / nh) * h
+    # x1 = ((x1 - dx) / nw) * w
+    # label = [x1, y1, x1 + box_w, y1 + box_h]
+    # return np.concatenate([np.array(label), box[4:]])
     h, w, nh, nw, dx, dy, _ = info_img
     x1, y1, x2, y2 = box[:4]
     box_h = ((y2 - y1) / nh) * h
     box_w = ((x2 - x1) / nw) * w
     y1 = ((y1 - dy) / nh) * h
     x1 = ((x1 - dx) / nw) * w
-    label = [x1, y1, x1 + box_w, y1 + box_h]
+
+    x2 = x1 + box_w
+    y2 = y1 + box_h
+
+    # 🔥 clamp (chặn trên/dưới)
+    x1 = max(0, min(x1, w))
+    y1 = max(0, min(y1, h))
+    x2 = max(0, min(x2, w))
+    y2 = max(0, min(y2, h))
+
+    label = [x1, y1, x2, y2]
+    # print("ahihi")
+    # label = [x1, y1, x1 + box_w, y1 + box_h]
     return np.concatenate([np.array(label), box[4:]])
 
 

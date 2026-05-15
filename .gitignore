@@ -8,3 +8,11 @@ test5.sh
 EfficientSAM/weights
 /weights
 apex
+*.png
+*.pt
+*.ipynb
+gpt
+input
+detection
+pred_images
+train2014
