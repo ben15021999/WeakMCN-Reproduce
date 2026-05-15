@@ -16,3 +16,4 @@ input
 detection
 pred_images
 train2014
+__pycache__
