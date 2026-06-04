@@ -16,7 +16,7 @@
 // https://github.com/torch/cunn/blob/master/lib/THCUNN/generic/SpatialConvolutionMM.cu
 
 
-at::Tensor
+at::Tensor 
 deform_conv2d_cuda_forward(const at::Tensor &input,
                            const at::Tensor &weight,
                            const at::Tensor &bias,

@@ -65,99 +65,83 @@ class LSTM_SA(nn.Module):
 
 
 class CLIP_SA(nn.Module):
-    def __init__(self, __C):
+
+    def __init__(self, __C, pretrained_emb=None, token_size=None):
         super(CLIP_SA, self).__init__()
 
-        # =====================================
-        # Load CLIP from HuggingFace
-        # =====================================
+        self.__C = __C
+
+        # =========================
+        # CLIP
+        # =========================
+        self.clip_name = __C.CLIP_MODEL
+
         self.tokenizer = CLIPTokenizer.from_pretrained(
-            "openai/clip-vit-base-patch32"
+            self.clip_name
         )
 
-        self.clip_text = CLIPTextModel.from_pretrained(
-            "openai/clip-vit-base-patch32"
+        self.text_encoder = CLIPTextModel.from_pretrained(
+            self.clip_name
         )
 
-        clip_dim = self.clip_text.config.hidden_size
-        # ViT-B/32 => 512
+        self.clip_dim = self.text_encoder.config.hidden_size
 
-        # =====================================
-        # Optional projection
-        # =====================================
+        # =========================
+        # projection
+        # =========================
         self.proj = nn.Linear(
-            clip_dim,
+            self.clip_dim,
             __C.HIDDEN_SIZE
         )
 
-        # =====================================
-        # Self Attention blocks
-        # =====================================
+        # =========================
+        # optional SA
+        # =========================
         self.sa_list = nn.ModuleList(
             [SA(__C) for _ in range(__C.N_SA)]
         )
 
         self.att_flat = AttFlat(__C)
 
-        # freeze CLIP nếu muốn
+        # freeze clip encoder
         if __C.EMBED_FREEZE:
-            for p in self.clip_text.parameters():
-                p.requires_grad = False
+            self.freeze_module(self.text_encoder)
 
-    def forward(self, text):
+    def freeze_module(self, module):
+        for param in module.parameters():
+            param.requires_grad = False
 
-        # =====================================
-        # Tokenize
-        # =====================================
-        tokens = self.tokenizer(
-            text,
-            padding=True,
-            truncation=True,
-            return_tensors="pt"
-        )
+    def forward(self, text_input):
 
-        input_ids = tokens["input_ids"].to(
-            next(self.parameters()).device
-        )
+        device = next(self.parameters()).device
 
-        attention_mask = tokens["attention_mask"].to(
-            next(self.parameters()).device
-        )
+        input_ids = text_input[
+            'input_ids'
+        ].to(device)
 
-        # =====================================
-        # CLIP Text Encoder
-        # =====================================
-        outputs = self.clip_text(
+        attention_mask = text_input[
+            'attention_mask'
+        ].to(device)
+
+        outputs = self.text_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask
         )
 
-        # [B, L, 512]
         lang_feat = outputs.last_hidden_state
 
-        # project nếu cần
         lang_feat = self.proj(lang_feat)
 
-        # =====================================
-        # mask
-        # True = masked position
-        # =====================================
         lang_feat_mask = (
             attention_mask == 0
         ).unsqueeze(1).unsqueeze(2)
 
-        # =====================================
-        # SA blocks
-        # =====================================
         for sa in self.sa_list:
             lang_feat = sa(
                 lang_feat,
                 lang_feat_mask
             )
 
-        # =====================================
-        # AttFlat
-        # =====================================
         flat_lang_feat = self.att_flat(
             lang_feat,
             lang_feat_mask
@@ -168,7 +152,6 @@ class CLIP_SA(nn.Module):
             'lang_feat': lang_feat,
             'lang_feat_mask': lang_feat_mask
         }
-
 
 backbone_dict={
     'lstm': LSTM_SA,

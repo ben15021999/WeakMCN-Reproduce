@@ -1,5 +1,5 @@
 MODEL:
-  MODEL: 'weakmcn'
+  MODEL: 'weakmcn_clip'
   USE_GLOVE: True
   WORD_EMBED_SIZE: 300
   EMBED_FREEZE: True
@@ -9,6 +9,7 @@ MODEL:
   FF_SIZE: 2048
   FLAT_GLIMPSES: 1
   LANG_ENC: 'clip'
+  CLIP_MODEL: 'openai/clip-vit-base-patch32'
   N_SA: 3
   VIS_ENC: 'yolov3'
   VIS_FREEZE: True
