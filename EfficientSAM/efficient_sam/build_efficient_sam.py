@@ -15,7 +15,8 @@ def build_efficient_sam_vitt():
     return build_efficient_sam(
         encoder_patch_embed_dim=192,
         encoder_num_heads=3,
-        checkpoint=os.path.join(current_directory, "EfficientSAM/weights/efficient_sam_vitt.pt"),
+        # checkpoint=os.path.join(current_directory, "EfficientSAM/weights/efficient_sam_vitt.pt"),
+        checkpoint='/kaggle/input/models/pokabu1999/efficient-sam/pytorch/default/1/efficient_sam_vitt.pt'
     ).eval()
 
 
@@ -23,5 +24,6 @@ def build_efficient_sam_vits():
     return build_efficient_sam(
         encoder_patch_embed_dim=384,
         encoder_num_heads=6,
-        checkpoint=os.path.join(current_directory, "EfficientSAM/weights/efficient_sam_vits.pt"),
+        # checkpoint=os.path.join(current_directory, "EfficientSAM/weights/efficient_sam_vits.pt"),
+        checkpoint='/kaggle/input/models/pokabu1999/efficient-sam/pytorch/default/1/efficient_sam_vits.pt'
     ).eval()

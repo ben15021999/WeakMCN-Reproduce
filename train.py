@@ -48,7 +48,8 @@ def train_one_epoch(__C,
     lr = AverageMeter('lr', ':.5f')
     meters = [batch_time, data_time, losses, losses_det, losses_mask, lr]
     meters_dict = {meter.name: meter for meter in meters}
-    progress = ProgressMeter(__C.VERSION, __C.EPOCHS, len(loader), meters, prefix='Train: ')
+    progress = ProgressMeter(__C.VERSION, __C.EPOCHS,
+                             len(loader), meters, prefix='Train: ')
     end = time.time()
 
     for ith_batch, data in enumerate(loader):
@@ -57,7 +58,7 @@ def train_one_epoch(__C,
         ref_iter, image_iter, mask_iter, box_iter, gt_box_iter, mask_id, info_iter, ref_txt, img_path = data
         # print(ref_txt)
         mask_iter = mask_iter.cuda(non_blocking=True)
-        ref_iter = ref_iter.cuda(non_blocking=True)
+        # ref_iter = ref_iter.cuda(non_blocking=True)
         image_iter = image_iter.cuda(non_blocking=True)
         box_iter = box_iter.cuda(non_blocking=True)
 
@@ -96,7 +97,8 @@ def train_one_epoch(__C,
                     loss = loss_det
         else:
             # loss = net(image_iter, ref_iter, gt_box_iter, info_iter)
-            loss_det, loss_mask = net(image_iter, ref_iter, box_gt=box_iter, mask_gt=mask_iter, info_iter=info_iter, epoch=epoch)
+            loss_det, loss_mask = net(
+                image_iter, ref_iter, box_gt=box_iter, mask_gt=mask_iter, info_iter=info_iter, epoch=epoch)
             if loss_mask is not None:
                 if epoch >= __C.WARM_EPOCH:
                     loss = loss_det + loss_mask
@@ -158,10 +160,13 @@ def train_one_epoch(__C,
         reduce_meters(meters_dict, rank, __C)
         if main_process(__C, rank):
             global_step = epoch * batches + ith_batch
-            writer.add_scalar("loss/train", losses.avg_reduce, global_step=global_step)
-            writer.add_scalar("loss_det/train", losses_det.avg_reduce, global_step=global_step)
+            writer.add_scalar("loss/train", losses.avg_reduce,
+                              global_step=global_step)
+            writer.add_scalar("loss_det/train",
+                              losses_det.avg_reduce, global_step=global_step)
             if loss_mask is not None:
-                writer.add_scalar("loss_mask/train", losses_mask.avg_reduce, global_step=global_step)
+                writer.add_scalar(
+                    "loss_mask/train", losses_mask.avg_reduce, global_step=global_step)
             if ith_batch % __C.PRINT_FREQ == 0 or ith_batch == len(loader):
                 progress.display(epoch, ith_batch)
         # break
@@ -182,18 +187,20 @@ def main_worker(gpu, __C):
                                 rank=__C.RANK)
 
     train_set = RefCOCODataSet(__C, split='train')
-    train_loader = loader(__C, train_set, gpu, shuffle=(not __C.MULTIPROCESSING_DISTRIBUTED), drop_last=True)
+    train_loader = loader(__C, train_set, gpu, shuffle=(
+        not __C.MULTIPROCESSING_DISTRIBUTED), drop_last=True)
 
     val_set = RefCOCODataSet(__C, split='val')
     val_loader = loader(__C, val_set, gpu, shuffle=False)
 
     net = ModelLoader(__C).Net(
         __C,
-        train_set.pretrained_emb,
-        train_set.token_size
+        None,
+        None
     )
     # optimizer
-    params = filter(lambda p: p.requires_grad, net.parameters())  # split_weights(net)
+    params = filter(lambda p: p.requires_grad,
+                    net.parameters())  # split_weights(net)
     std_optim = getattr(Optim, __C.OPT)
 
     eval_str = 'params, lr=%f' % __C.LR
@@ -205,7 +212,8 @@ def main_worker(gpu, __C):
 
     if os.path.isfile(__C.PRETRAIN_WEIGHT) and not os.path.isfile(__C.RESUME_PATH):
 
-        checkpoint = torch.load(__C.PRETRAIN_WEIGHT, map_location=torch.device('cpu'))
+        checkpoint = torch.load(__C.PRETRAIN_WEIGHT,
+                                map_location=torch.device('cpu'))
         new_dict = {}
 
         for k in checkpoint:
@@ -228,15 +236,18 @@ def main_worker(gpu, __C):
         # print(net)
         total = sum([param.nelement() for param in net.parameters()])
         print('  + Number of all params: %.2fM' % (total / 1e6))  # 每一百万为一个单位
-        total = sum([param.nelement() for param in net.parameters() if param.requires_grad])
-        print('  + Number of trainable params: %.2fM' % (total / 1e6))  # 每一百万为一个单位
+        total = sum([param.nelement()
+                    for param in net.parameters() if param.requires_grad])
+        print('  + Number of trainable params: %.2fM' %
+              (total / 1e6))  # 每一百万为一个单位
 
     scheduler = get_lr_scheduler(__C, optimizer, len(train_loader))
 
     start_epoch = 0
 
     if os.path.isfile(__C.RESUME_PATH):
-        checkpoint = torch.load(__C.RESUME_PATH, map_location=lambda storage, loc: storage.cuda())
+        checkpoint = torch.load(
+            __C.RESUME_PATH, map_location=lambda storage, loc: storage.cuda())
         new_dict = {}
         for k in checkpoint['state_dict']:
             if 'module.' in k:
@@ -259,22 +270,25 @@ def main_worker(gpu, __C):
     else:
         scalar = None
 
-    SAVE_PATH = os.path.join(__C.LOG_PATH, __C.MODEL, 'seed_{}'.format(__C.SEED), str(__C.VERSION))
+    SAVE_PATH = os.path.join(__C.LOG_PATH, __C.MODEL,
+                             'seed_{}'.format(__C.SEED), str(__C.VERSION))
     if main_process(__C, gpu):
         writer = SummaryWriter(log_dir=SAVE_PATH)
     else:
         writer = None
 
-    save_ids = np.random.randint(1, len(val_loader) * __C.BATCH_SIZE, 100) if __C.LOG_IMAGE else None
+    save_ids = np.random.randint(
+        1, len(val_loader) * __C.BATCH_SIZE, 100) if __C.LOG_IMAGE else None
 
     best_det_acc_list = []
     for ith_epoch in range(start_epoch, __C.EPOCHS):
         if __C.USE_EMA and ema is None:
             ema = EMA(net, 0.9997)
-        train_one_epoch(__C, net, optimizer, scheduler, train_loader, scalar, writer, ith_epoch, gpu, ema)
+        train_one_epoch(__C, net, optimizer, scheduler,
+                        train_loader, scalar, writer, ith_epoch, gpu, ema)
         # box_ap = validate(__C, net, val_loader, writer, ith_epoch, gpu, val_set.ix_to_token, save_ids=save_ids,
         #                            ema=ema)
-        box_ap, mask_ap = validate_box_and_mask(__C, net, val_loader, writer, ith_epoch, gpu, val_set.ix_to_token,
+        box_ap, mask_ap = validate_box_and_mask(__C, net, val_loader, writer, ith_epoch, gpu, None,
                                                 save_ids=save_ids,
                                                 ema=ema)
         best_det_acc_list.append(box_ap)
@@ -325,7 +339,8 @@ def main_worker(gpu, __C):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, required=True, default='./config/refcoco.yaml')
+    parser.add_argument('--config', type=str, required=True,
+                        default='./config/refcoco.yaml')
     args = parser.parse_args()
     assert args.config is not None
     __C = config.load_cfg_from_cfg_file(args.config)
@@ -334,7 +349,8 @@ def main():
     seed_everything(__C.SEED)
     N_GPU = len(__C.GPU)
 
-    SAVE_PATH = os.path.join(__C.LOG_PATH, __C.MODEL, 'seed_{}'.format(__C.SEED), str(__C.VERSION))
+    SAVE_PATH = os.path.join(__C.LOG_PATH, __C.MODEL,
+                             'seed_{}'.format(__C.SEED), str(__C.VERSION))
     if not os.path.exists(SAVE_PATH):
         os.makedirs(os.path.join(SAVE_PATH, 'ckpt'), exist_ok=True)
 

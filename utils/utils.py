@@ -7,6 +7,77 @@ import math
 import numpy as np
 
 
+# class EMA(object):
+#     '''
+#         apply expontential moving average to a model. This should have same function as the `tf.train.ExponentialMovingAverage` of tensorflow.
+#         usage:
+#             model = resnet()
+#             model.train()
+#             ema = EMA(model, 0.9999)
+#             ....
+#             for img, lb in dataloader:
+#                 loss = ...
+#                 loss.backward()
+#                 optim.step()
+#                 ema.update_params() # apply ema
+#             evaluate(model)  # evaluate with original model as usual
+#             ema.apply_shadow() # copy ema status to the model
+#             evaluate(model) # evaluate the model with ema paramters
+#             ema.restore() # resume the model parameters
+#         args:
+#             - model: the model that ema is applied
+#             - alpha: each parameter p should be computed as p_hat = alpha * p + (1. - alpha) * p_hat
+#             - buffer_ema: whether the model buffers should be computed with ema method or just get kept
+#         methods:
+#             - update_params(): apply ema to the model, usually call after the optimizer.step() is called
+#             - apply_shadow(): copy the ema processed parameters to the model
+#             - restore(): restore the original model parameters, this would cancel the operation of apply_shadow()
+#     '''
+
+#     def __init__(self, model, alpha, buffer_ema=True):
+#         self.step = 0
+#         self.model = model
+#         self.alpha = alpha
+#         self.buffer_ema = buffer_ema
+#         self.shadow = self.get_model_state()
+#         self.backup = {}
+#         self.param_keys = [k for k, _ in self.model.named_parameters()]
+#         self.buffer_keys = [k for k, _ in self.model.named_buffers()]
+
+#     def update_params(self):
+#         decay = min(self.alpha, (self.step + 1) / (self.step + 10))
+#         state = self.model.state_dict()
+#         for name in self.param_keys:
+#             self.shadow[name].copy_(
+#                 decay * self.shadow[name]
+#                 + (1 - decay) * state[name]
+#             )
+#         for name in self.buffer_keys:
+#             if "efficientsam" in name:
+#                 continue
+#             if "clip" in name:
+#                 continue
+#             if self.buffer_ema:
+#                 self.shadow[name].copy_(
+#                     decay * self.shadow[name]
+#                     + (1 - decay) * state[name]
+#                 )
+#             else:
+#                 self.shadow[name].copy_(state[name])
+#         self.step += 1
+
+#     def apply_shadow(self):
+#         self.backup = self.get_model_state()
+#         self.model.load_state_dict(self.shadow)
+
+#     def restore(self):
+#         self.model.load_state_dict(self.backup)
+
+#     def get_model_state(self):
+#         return {
+#             k: v.clone().detach()
+#             for k, v in self.model.state_dict().items()
+#         }
 class EMA(object):
     '''
         apply expontential moving average to a model. This should have same function as the `tf.train.ExponentialMovingAverage` of tensorflow.
@@ -55,7 +126,7 @@ class EMA(object):
         for name in self.buffer_keys:
             if "efficientsam" in name:
                 continue
-            if "clip" in name:
+            if "text_encoder" in name:
                 continue
             if self.buffer_ema:
                 self.shadow[name].copy_(
@@ -149,7 +220,8 @@ def draw_box(image, bbox, color):
     # color: bgr
     # bbox: [x1, y1, x2, y2]
     thickness = 2
-    image = cv2.rectangle(image, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color=color, thickness=thickness)
+    image = cv2.rectangle(
+        image, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color=color, thickness=thickness)
     return image
 
 
@@ -163,13 +235,15 @@ def draw_mask(image, mask, color):
     # mask = mask * 255
     # mask = mask.astype(np.uint8)
     mask = mask > 0
-    contours, hierarchy = cv2.findContours(mask.astype(np.uint8), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours, hierarchy = cv2.findContours(mask.astype(
+        np.uint8), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
     overlay = image.copy()
     overlay[mask] = color
     image = cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0.0)
     if draw_contours:
-        image = cv2.drawContours(image, contours, -1, (255, 255, 255), coutour_thickness)
+        image = cv2.drawContours(
+            image, contours, -1, (255, 255, 255), coutour_thickness)
 
     return image
 
@@ -196,13 +270,16 @@ def batch_box_iou(box1, box2, threshold=0.5, iou_out=False):
     :param box2:  B,1,1,4
     :return: N
     """
-    in_h = torch.min(box1[..., 2], box2[..., 2]) - torch.max(box1[..., 0], box2[..., 0])
-    in_w = torch.min(box1[..., 3], box2[..., 3]) - torch.max(box1[..., 1], box2[..., 1])
+    in_h = torch.min(box1[..., 2], box2[..., 2]) - \
+        torch.max(box1[..., 0], box2[..., 0])
+    in_w = torch.min(box1[..., 3], box2[..., 3]) - \
+        torch.max(box1[..., 1], box2[..., 1])
     in_h = in_h.clamp(min=0.)
     in_w = in_w.clamp(min=0.)
     inter = in_h * in_w
     union = (box1[..., 2] - box1[..., 0]) * (box1[..., 3] - box1[..., 1]) + \
-            (box2[..., 2] - box2[..., 0]) * (box2[..., 3] - box2[..., 1]) - inter
+            (box2[..., 2] - box2[..., 0]) * \
+        (box2[..., 3] - box2[..., 1]) - inter
     iou = inter / union
     if iou_out:
         return iou > threshold, iou
@@ -325,15 +402,17 @@ def get_lr_scheduler(__C, optimizer):
                         coef = __C.LR_DECAY_R ** (i + 1)
             return coef
 
-        scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: lr_func(epoch))
+        scheduler = lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda epoch: lr_func(epoch))
     elif __C.SCHEDULER == 'cosine':
         scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=__C.EPOCHS)
     else:
         t, T = __C.WARMUP, __C.EPOCHS
         n_t = 0.5
-        lr_func = lambda epoch: (0.9 * epoch / t + __C.LR) if epoch < t else __C.LR if n_t * (
-                1 + math.cos(math.pi * (epoch - t) / (T - t))) < __C.LR else n_t * (
-                1 + math.cos(math.pi * (epoch - t) / (T - t)))
+
+        def lr_func(epoch): return (0.9 * epoch / t + __C.LR) if epoch < t else __C.LR if n_t * (
+            1 + math.cos(math.pi * (epoch - t) / (T - t))) < __C.LR else n_t * (
+            1 + math.cos(math.pi * (epoch - t) / (T - t)))
         scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_func)
     return scheduler
 
@@ -357,12 +436,13 @@ def get_lr_scheduler(__C, optimizer, n_iter_per_epoch):
 
         scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_func)
     elif __C.SCHEDULER == 'cosine':
-        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=__C.EPOCHS * n_iter_per_epoch)
+        scheduler = lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=__C.EPOCHS * n_iter_per_epoch)
     else:
         t, T = __C.WARMUP * n_iter_per_epoch, __C.EPOCHS * n_iter_per_epoch
         n_t = 0.5
         warm_step_lr = (__C.LR - __C.WARMUP_LR) / t
-        lr_func = lambda step: (step * warm_step_lr + __C.WARMUP_LR) / __C.LR if step < t \
+        def lr_func(step): return (step * warm_step_lr + __C.WARMUP_LR) / __C.LR if step < t \
             else (__C.MIN_LR + n_t * (__C.LR - __C.MIN_LR) * (1 + math.cos(math.pi * (step - t) / (T - t)))) / __C.LR
 
         scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_func)
@@ -476,7 +556,8 @@ def lr_power_decay(lr_start=2.5e-4, lr_power=0.9, warm_up_lr=0., step_all=45 * 1
         if epoch < warm_up_step:
             lr = warm_up(warm_up_lr, lr_start, epoch, warm_up_step)
         else:
-            lr = lr_start * ((1 - float(epoch - warm_up_step) / (step_all - warm_up_step)) ** lr_power)
+            lr = lr_start * ((1 - float(epoch - warm_up_step) /
+                             (step_all - warm_up_step)) ** lr_power)
         return lr
         # print("learning rate is", lr)
 
@@ -509,7 +590,8 @@ def draw_visualization(image, sent, pred_box, gt_box, draw_text=True, savepath=N
     colors = [(255, 0, 0), (0, 255, 0), (0, 191, 255)]
 
     cv2.rectangle(image, (left, top), (right, bottom), colors[0], 2)
-    cv2.rectangle(image, (gt_left, gt_top), (gt_right, gt_bottom), colors[1], 2)
+    cv2.rectangle(image, (gt_left, gt_top),
+                  (gt_right, gt_bottom), colors[1], 2)
     # cv2.imwrite(savepath+str(k)+'.jpg',img)
 
     if draw_text:
@@ -622,7 +704,8 @@ def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45):
         if not image_pred.size(0):
             continue
         # Get detections with higher confidence scores than the threshold
-        ind = (image_pred[:, 5:] * image_pred[:, 4][:, None] >= conf_thre).nonzero()
+        ind = (image_pred[:, 5:] * image_pred[:, 4]
+               [:, None] >= conf_thre).nonzero()
         # Detections ordered as (x1, y1, x2, y2, obj_conf, class_conf, class_pred)
         detections = torch.cat((
             image_pred[ind[:, 0], :5],
