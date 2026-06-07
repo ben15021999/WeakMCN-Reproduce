@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from transformers import (
     CLIPTokenizer,
@@ -86,13 +87,21 @@ class CLIP_SA(nn.Module):
 
         self.clip_dim = self.text_encoder.config.hidden_size
 
-        # =========================
-        # projection
-        # =========================
-        self.proj = nn.Linear(
-            self.clip_dim,
-            __C.HIDDEN_SIZE
-        )
+        # # =========================
+        # # projection
+        # # =========================
+        # self.proj = nn.Linear(
+        #     self.clip_dim,
+        #     __C.HIDDEN_SIZE
+        # )
+
+        # Adapter GRU 
+        self.proj = nn.Linear(self.clip_dim * 2, self.clip_dim)
+
+        # Project back to hidden size 
+        self.gru = nn.GRU(input_size=self.clip_dim, hidden_size=self.clip_dim,
+                          num_layers=1, batch_first=True, bidirectional=True)
+        # self.hidden_dim = self.clip_dim
 
         # =========================
         # optional SA
@@ -113,27 +122,37 @@ class CLIP_SA(nn.Module):
 
     def forward(self, text_input):
 
+        encoded = self.tokenizer(list(text_input), padding='max_length',
+                                 truncation=True, return_tensors='pt')
+
         device = next(self.parameters()).device
 
-        input_ids = text_input[
-            'input_ids'
-        ].to(device)
+        encoded = {k: v.to(device) for k, v in encoded.items()}
 
-        attention_mask = text_input[
-            'attention_mask'
-        ].to(device)
+        # input_ids = text_input[
+        #     'input_ids'
+        # ].to(device)
+
+        # attention_mask = text_input[
+        #     'attention_mask'
+        # ].to(device)
+
+        # outputs = self.text_encoder(
+        #     input_ids=input_ids,
+        #     attention_mask=attention_mask
+        # )
 
         outputs = self.text_encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
+            input_ids=encoded['input_ids'], attention_mask=encoded['attention_mask'])
 
         lang_feat = outputs.last_hidden_state
+        # Adapter GRU 
+        lang_feat, _ = self.gru(lang_feat)
 
         lang_feat = self.proj(lang_feat)
 
         lang_feat_mask = (
-            attention_mask == 0
+            encoded['attention_mask'] == 0
         ).unsqueeze(1).unsqueeze(2)
 
         for sa in self.sa_list:
@@ -146,6 +165,7 @@ class CLIP_SA(nn.Module):
             lang_feat,
             lang_feat_mask
         )
+        flat_lang_feat = F.normalize(flat_lang_feat, dim=-1)
 
         return {
             'flat_lang_feat': flat_lang_feat,
