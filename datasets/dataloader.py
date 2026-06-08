@@ -357,7 +357,8 @@ class RefCOCODataSet(Data.Dataset):
         return image, mask, box, self.refs_anno[idx]['mask_id'], self.refs_anno[idx]['iid'], img_path
 
     def __getitem__(self, idx):
-        ref_txt = self.load_refs(idx)
+        # ref_txt = self.load_refs(idx)
+        _, ref_txt = self.load_refs(idx)
         image_iter, mask_iter, gt_box_iter, mask_id, iid, img_path = self.load_img_feats(
             idx)
         image_iter_ori = cv2.cvtColor(image_iter, cv2.COLOR_BGR2RGB)
