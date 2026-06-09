@@ -234,7 +234,7 @@ std::vector<at::Tensor> deform_conv2d_cuda_backward(const at::Tensor &input,
                                              height_out, width_out, kernel_h, kernel_w,
                                              pad_h, pad_w, stride_h, stride_w,
                                              dilation_h, dilation_w, deformable_group,
-                                             grad_input.data<scalar_t>() + n * im2col_step_ * per_input_size);
+                                             grad_input.data_ptr<scalar_t>() + n * im2col_step_ * per_input_size);
 
             // gradient w.r.t. weight, dWeight should accumulate across the batch and group
             deformable_2d_im2col_cuda(at::cuda::getCurrentCUDAStream(),
