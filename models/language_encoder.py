@@ -110,6 +110,7 @@ class CLIP_SA(nn.Module):
             self.freeze_module(self.text_encoder)
 
     def freeze_module(self, module):
+        module.eval()
         for param in module.parameters():
             param.requires_grad = False
 

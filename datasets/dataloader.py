@@ -1,6 +1,9 @@
 import os
 import cv2
-import json, re, spacy, random
+import json
+import re
+import spacy
+import random
 
 import numpy as np
 
@@ -280,32 +283,43 @@ class RefCOCODataSet(Data.Dataset):
 
         return token_to_ix, ix_to_token, pretrained_emb, max_token
 
-    def proc_ref(self, ref, token_to_ix, max_token):
-        ques_ix = np.zeros(max_token, np.int64)
+    def proc_ref(self, ref):
+        # ques_ix = np.zeros(max_token, np.int64)
 
-        words = re.sub(
-            r"([.,'!?\"()*#:;])",
-            '',
-            ref.lower()
-        ).replace('-', ' ').replace('/', ' ').split()
+        # words = re.sub(
+        #     r"([.,'!?\"()*#:;])",
+        #     '',
+        #     ref.lower()
+        # ).replace('-', ' ').replace('/', ' ').split()
 
-        for ix, word in enumerate(words):
-            if word in token_to_ix:
-                ques_ix[ix] = token_to_ix[word]
-            else:
-                ques_ix[ix] = token_to_ix['UNK']
+        # for ix, word in enumerate(words):
+        #     if word in token_to_ix:
+        #         ques_ix[ix] = token_to_ix[word]
+        #     else:
+        #         ques_ix[ix] = token_to_ix['UNK']
 
-            if ix + 1 == max_token:
-                break
+        #     if ix + 1 == max_token:
+        #         break
 
-        return ques_ix
+        # return ques_ix
+        encoded = self.tokenizer(
+            ref,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_token,
+            return_tensors='pt'
+        )
+
+        return {
+            'input_ids': encoded['input_ids'].squeeze(0),
+            'attention_mask': encoded['attention_mask'].squeeze(0)
+        }
 
     def load_refs(self, idx):
         refs = self.refs_anno[idx]['refs']
-        ref_txt = refs[
-            np.random.choice(len(refs))
-        ]
-        return ref_txt
+        ref_txt = refs[np.random.choice(len(refs))]
+        ref = self.proc_ref(ref_txt)
+        return ref, ref_txt
 
     def preprocess_info(self, img, mask, box, iid, lr_flip=False):
         h, w, _ = img.shape
@@ -357,8 +371,8 @@ class RefCOCODataSet(Data.Dataset):
         return image, mask, box, self.refs_anno[idx]['mask_id'], self.refs_anno[idx]['iid'], img_path
 
     def __getitem__(self, idx):
-        ref_txt = self.load_refs(idx)
-        # _, ref_txt = self.load_refs(idx)
+        # ref_txt = self.load_refs(idx)
+        ref_iter, ref_txt = self.load_refs(idx)
         image_iter, mask_iter, gt_box_iter, mask_id, iid, img_path = self.load_img_feats(
             idx)
         image_iter_ori = cv2.cvtColor(image_iter, cv2.COLOR_BGR2RGB)
@@ -375,7 +389,7 @@ class RefCOCODataSet(Data.Dataset):
                                                                           flip_box)
         image_iter = self.transforms(image_iter)
         return \
-            ref_txt, \
+            ref_iter['input_ids'], \
             image_iter, \
             torch.from_numpy(mask_iter).float(), \
             torch.from_numpy(box_iter).float(), \
@@ -392,75 +406,74 @@ class RefCOCODataSet(Data.Dataset):
         random.shuffle(list)
 
 
-class RefCOCOCollate:
+# class RefCOCOCollate:
 
-    def __init__(self, clip_model):
+#     def __init__(self, clip_model):
 
-        self.tokenizer = CLIPTokenizer.from_pretrained(
-            clip_model
-        )
+#         self.tokenizer = CLIPTokenizer.from_pretrained(
+#             clip_model
+#         )
 
-    def __call__(self, batch):
+#     def __call__(self, batch):
 
-        refs = []
-        images = []
-        masks = []
-        boxes = []
-        gt_boxes = []
-        mask_ids = []
-        info_iters = []
-        img_paths = []
+#         refs = []
+#         images = []
+#         masks = []
+#         boxes = []
+#         gt_boxes = []
+#         mask_ids = []
+#         info_iters = []
+#         img_paths = []
 
-        for sample in batch:
+#         for sample in batch:
 
-            refs.append(sample[0])
+#             refs.append(sample[0])
 
-            images.append(sample[1])
+#             images.append(sample[1])
 
-            masks.append(sample[2])
+#             masks.append(sample[2])
 
-            boxes.append(sample[3])
+#             boxes.append(sample[3])
 
-            gt_boxes.append(sample[4])
+#             gt_boxes.append(sample[4])
 
-            mask_ids.append(sample[5])
+#             mask_ids.append(sample[5])
 
-            info_iters.append(sample[6])
+#             info_iters.append(sample[6])
 
-            img_paths.append(sample[7])
+#             img_paths.append(sample[7])
 
-        # =========================
-        # tokenize text
-        # =========================
-        text_tokens = self.tokenizer(
-            refs,
-            padding=True,
-            truncation=True,
-            return_tensors='pt'
-        )
+#         # =========================
+#         # tokenize text
+#         # =========================
+#         text_tokens = self.tokenizer(
+#             refs,
+#             padding=True,
+#             truncation=True,
+#             return_tensors='pt'
+#         )
 
-        return (
-            text_tokens,
-            torch.stack(images),
-            torch.stack(masks),
-            torch.stack(boxes),
-            torch.stack(gt_boxes),
-            mask_ids,
-            np.stack(info_iters),
-            refs,
-            img_paths
-        )
+#         return (
+#             text_tokens,
+#             torch.stack(images),
+#             torch.stack(masks),
+#             torch.stack(boxes),
+#             torch.stack(gt_boxes),
+#             mask_ids,
+#             np.stack(info_iters),
+#             refs,
+#             img_paths
+#         )
 
 
 def loader(__C, dataset: torch.utils.data.Dataset, rank: int, shuffle, drop_last=False):
-    collate_fn = RefCOCOCollate(
-        __C.CLIP_MODEL
-    )
+    # collate_fn = RefCOCOCollate(
+    #     __C.CLIP_MODEL
+    # )
     data_loader = DataLoader(dataset,
                              batch_size=__C.BATCH_SIZE,
                              shuffle=shuffle,
                              num_workers=__C.NUM_WORKER,
                              pin_memory=False,
-                             drop_last=drop_last,
-                             collate_fn=collate_fn)
+                             drop_last=drop_last)
     return data_loader
