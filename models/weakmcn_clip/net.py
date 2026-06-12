@@ -283,6 +283,7 @@ class Net(nn.Module):
             predictions_s = self.head.getPrediction(x_new, y_new)
             predictions_list = [predictions_s]
             pred_boxes = self.get_boxes(boxes_sml_new, predictions_list, self.class_num)
+            pred_boxes = pred_boxes.cpu()
             pred_boxes = clip_boxes_to_image(pred_boxes, info_iter)
             prompt, pts_labels = self.generate_prompts(pred_boxes, using_gt=False)
             x = self.reverse_normalization(x)

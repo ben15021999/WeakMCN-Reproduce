@@ -1,19 +1,18 @@
-from utils.distributed import *
-import torch.multiprocessing as mp
-from utils.ckpt import *
-from torch.nn.parallel import DistributedDataParallel as DDP
-from utils.logging import *
-import argparse
-import time
-from utils import config
-from datasets.dataloader import loader, RefCOCODataSet
-from tensorboardX import SummaryWriter
-from utils.utils import *
-import torch.optim as Optim
-from importlib import import_module
-import cv2
 import numpy as np
-
+import cv2
+from importlib import import_module
+import torch.optim as Optim
+from utils.utils import *
+from tensorboardX import SummaryWriter
+from datasets.dataloader import loader, RefCOCODataSet
+from utils import config
+import time
+import argparse
+from utils.logging import *
+from torch.nn.parallel import DistributedDataParallel as DDP
+from utils.ckpt import *
+import torch.multiprocessing as mp
+from utils.distributed import *
 
 class ModelLoader:
     def __init__(self, __C):
@@ -103,8 +102,13 @@ def validate_box_and_mask(__C,
             # print(ref_txt)
             mask_iter = mask_iter.cuda(non_blocking=True)
             # ref_iter = ref_iter.cuda(non_blocking=True)
+            ref_iter = {
+                k: v.cuda(non_blocking=True)
+                for k, v in ref_iter.items()
+            }
             image_iter = image_iter.cuda(non_blocking=True)
             box_iter = box_iter.cuda(non_blocking=True)
+            info_iter = info_iter.cuda(non_blocking=True)
             gt_box_iter = gt_box_iter.cuda(non_blocking=True)
             box, mask = net(image_iter, ref_iter, box_gt=box_iter,
                             mask_gt=mask_iter, info_iter=info_iter)
@@ -120,7 +124,7 @@ def validate_box_and_mask(__C,
             gt_box_iter[:, 2] = (gt_box_iter[:, 0] + gt_box_iter[:, 2])
             gt_box_iter[:, 3] = (gt_box_iter[:, 1] + gt_box_iter[:, 3])
             gt_box_iter = gt_box_iter.cpu().numpy()
-            # info_iter = info_iter.cpu().numpy()
+            info_iter = info_iter.cpu().numpy()
             box = box.squeeze(1).cpu().numpy()
             pred_box_vis = box.copy()
 

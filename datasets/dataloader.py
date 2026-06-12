@@ -1,19 +1,17 @@
-import os
-import cv2
-import json
-import re
-import spacy
 import random
-
-import numpy as np
-
-import torch
-import torch.utils.data as Data
-from torch.utils.data import DataLoader
-from torchvision.transforms import transforms
-from transformers import CLIPTokenizer
-
+import spacy
+import re
+import json
 from utils.utils import label2yolobox
+from transformers import CLIPTokenizer
+from torchvision.transforms import transforms
+from torch.utils.data import DataLoader
+import torch.utils.data as Data
+import torch
+import numpy as np
+import cv2
+import os
+
 
 # class RefCOCODataSet(Data.Dataset):
 #     def __init__(self, __C, split):
@@ -306,7 +304,6 @@ class RefCOCODataSet(Data.Dataset):
             ref,
             padding='max_length',
             truncation=True,
-            max_length=self.max_token,
             return_tensors='pt'
         )
 
@@ -389,7 +386,7 @@ class RefCOCODataSet(Data.Dataset):
                                                                           flip_box)
         image_iter = self.transforms(image_iter)
         return \
-            ref_iter['input_ids'], \
+            ref_iter, \
             image_iter, \
             torch.from_numpy(mask_iter).float(), \
             torch.from_numpy(box_iter).float(), \

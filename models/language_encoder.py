@@ -1,15 +1,12 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
+from models.network_blocks import SA, AttFlat
+from utils.utils import make_mask
 from transformers import (
     CLIPTokenizer,
     CLIPTextModel
 )
-
-from models.network_blocks import SA,AttFlat
-from utils.utils import make_mask
-
+import torch.nn.functional as F
+import torch.nn as nn
+import torch
 
 class LSTM_SA(nn.Module):
     def __init__(self, __C, pretrained_emb, token_size):
@@ -33,10 +30,12 @@ class LSTM_SA(nn.Module):
         )
 
         self.sa_list = nn.ModuleList([SA(__C) for _ in range(__C.N_SA)])
-        self.att_flat=AttFlat(__C)
+        self.att_flat = AttFlat(__C)
         if __C.EMBED_FREEZE:
             self.frozen(self.embedding)
+
     def frozen(self, module):
+        module.eval()
         if getattr(module, 'module', False):
             for child in module.module():
                 for param in child.parameters():
@@ -44,6 +43,7 @@ class LSTM_SA(nn.Module):
         else:
             for param in module.parameters():
                 param.requires_grad = False
+
     def forward(self, ques_ix):
 
         # Pre-process Language Feature
@@ -51,15 +51,14 @@ class LSTM_SA(nn.Module):
         lang_feat = self.embedding(ques_ix)
         lang_feat, _ = self.lstm(lang_feat)
 
-
         for sa in self.sa_list:
             lang_feat = sa(lang_feat, lang_feat_mask)
 
         flat_lang_feat = self.att_flat(lang_feat, lang_feat_mask)
-        return  {
-            'flat_lang_feat':flat_lang_feat,
-            'lang_feat':lang_feat,
-            'lang_feat_mask':lang_feat_mask
+        return {
+            'flat_lang_feat': flat_lang_feat,
+            'lang_feat': lang_feat,
+            'lang_feat_mask': lang_feat_mask
         }
 
 
@@ -111,20 +110,20 @@ class CLIP_SA(nn.Module):
 
     def freeze_module(self, module):
         module.eval()
-        for param in module.parameters():
-            param.requires_grad = False
+        if getattr(module, 'module', False):
+            for child in module.module():
+                for param in child.parameters():
+                    param.requires_grad = False
+        else:
+            for param in module.parameters():
+                param.requires_grad = False
 
-    def forward(self, text_input):
+    def forward(self, input_ids, attention_mask):
 
-        device = next(self.parameters()).device
+        # device = next(self.parameters()).device
+        # input_ids = input_ids.to(device)
 
-        input_ids = text_input[
-            'input_ids'
-        ].to(device)
-
-        attention_mask = text_input[
-            'attention_mask'
-        ].to(device)
+        # attention_mask = attention_mask.to(device)
 
         outputs = self.text_encoder(
             input_ids=input_ids,
@@ -134,7 +133,7 @@ class CLIP_SA(nn.Module):
         lang_feat = outputs.last_hidden_state
 
         # lang_feat, _ = self.gru(lang_feat)
-        
+
         lang_feat = self.proj(lang_feat)
 
         lang_feat_mask = (
@@ -147,10 +146,6 @@ class CLIP_SA(nn.Module):
                 lang_feat_mask
             )
 
-        # flat_lang_feat = self.att_flat(
-        #     lang_feat,
-        #     lang_feat_mask
-        # )
         flat_lang_feat = lang_feat.mean(dim=1)
         flat_lang_feat = F.normalize(
             flat_lang_feat,
@@ -163,11 +158,13 @@ class CLIP_SA(nn.Module):
             'lang_feat_mask': lang_feat_mask
         }
 
-backbone_dict={
+
+backbone_dict = {
     'lstm': LSTM_SA,
     'clip': CLIP_SA,
 }
 
+
 def language_encoder(__C, pretrained_emb, token_size):
-    lang_enc=backbone_dict[__C.LANG_ENC](__C, pretrained_emb, token_size)
+    lang_enc = backbone_dict[__C.LANG_ENC](__C, pretrained_emb, token_size)
     return lang_enc
