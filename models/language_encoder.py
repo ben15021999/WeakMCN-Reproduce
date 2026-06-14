@@ -130,11 +130,12 @@ class CLIP_SA(nn.Module):
             attention_mask=attention_mask
         )
 
-        lang_feat = outputs.last_hidden_state
+        # lang_feat = outputs.last_hidden_state
 
         # lang_feat, _ = self.gru(lang_feat)
 
-        lang_feat = self.proj(lang_feat)
+        # lang_feat = self.proj(lang_feat)
+        lang_feat = self.proj(outputs.last_hidden_state)
 
         lang_feat_mask = (
             attention_mask == 0
@@ -146,11 +147,13 @@ class CLIP_SA(nn.Module):
                 lang_feat_mask
             )
 
-        flat_lang_feat = lang_feat.mean(dim=1)
-        flat_lang_feat = F.normalize(
-            flat_lang_feat,
-            dim=-1
-        )
+        flat_lang_feat = self.att_flat(lang_feat, lang_feat_mask)
+
+        # flat_lang_feat = lang_feat.mean(dim=1)
+        # flat_lang_feat = F.normalize(
+        #     flat_lang_feat,
+        #     dim=-1
+        # )
 
         return {
             'flat_lang_feat': flat_lang_feat,
