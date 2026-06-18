@@ -118,23 +118,22 @@ class EMA(object):
     def update_params(self):
         decay = min(self.alpha, (self.step + 1) / (self.step + 10))
         state = self.model.state_dict()
-        for name in self.param_keys:
-            self.shadow[name].copy_(
-                decay * self.shadow[name]
-                + (1 - decay) * state[name]
+
+        for name, value in state.items():
+
+            if name not in self.shadow:
+                self.shadow[name] = value.clone().detach()
+                continue
+
+            if not value.dtype.is_floating_point:
+                self.shadow[name] = value.clone()
+                continue
+
+            self.shadow[name].mul_(decay).add_(
+                value,
+                alpha=(1 - decay)
             )
-        for name in self.buffer_keys:
-            if "efficientsam" in name:
-                continue
-            if "text_encoder" in name:
-                continue
-            if self.buffer_ema:
-                self.shadow[name].copy_(
-                    decay * self.shadow[name]
-                    + (1 - decay) * state[name]
-                )
-            else:
-                self.shadow[name].copy_(state[name])
+
         self.step += 1
 
     def apply_shadow(self):
