@@ -264,6 +264,14 @@ def main_worker(gpu, __C):
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
         start_epoch = checkpoint['epoch']
+        if __C.USE_EMA:
+            ema = EMA(net, 0.9997)
+            
+            if 'ema_shadow' in checkpoint:
+                ema.shadow = checkpoint['ema_shadow']
+                ema.step = checkpoint['ema_step']
+
+                print("EMA restored, step =", ema.step)
         if main_process(__C, gpu):
             print("==> loaded checkpoint from {}\n".format(__C.RESUME_PATH) +
                   "==> epoch: {} lr: {} ".format(checkpoint['epoch'], checkpoint['lr']))
@@ -298,10 +306,13 @@ def main_worker(gpu, __C):
                                                 ema=ema)
         best_det_acc_list.append(box_ap)
         if main_process(__C, gpu):
+            save_dict = {'epoch': ith_epoch + 1, 'state_dict': net.state_dict(), 'optimizer': optimizer.state_dict(),
+                         'scheduler': scheduler.state_dict(), 'lr': optimizer.param_groups[0]["lr"]}
             if ema is not None:
                 ema.apply_shadow()
-            torch.save({'epoch': ith_epoch + 1, 'state_dict': net.state_dict(), 'optimizer': optimizer.state_dict(),
-                        'scheduler': scheduler.state_dict(), 'lr': optimizer.param_groups[0]["lr"], },
+                save_dict['ema_shadow'] = ema.shadow
+                save_dict['ema_step'] = ema.step
+            torch.save(save_dict,
                        os.path.join(SAVE_PATH, 'ckpt', 'last.pth'))
             # torch.save({'epoch': ith_epoch + 1, 'state_dict': net.state_dict(), 'optimizer': optimizer.state_dict(),
             #             'scheduler': scheduler.state_dict(), 'lr': optimizer.param_groups[0]["lr"], },
