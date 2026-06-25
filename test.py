@@ -395,7 +395,7 @@ def main_worker(gpu, __C):
     save_ids = np.random.randint(
         1, len(val_loader) * __C.BATCH_SIZE, 100) if __C.LOG_IMAGE else None
     for loader_, prefix_ in zip(loaders, prefixs):
-        box_ap, mask_ap = validate_box_and_mask(__C, net, loader_, writer, 0, gpu, val_set.ix_to_token,
+        box_ap, mask_ap = validate_box_and_mask(__C, net, loader_, writer, 0, gpu, None,
                                                 save_ids=save_ids, prefix=prefix_)
         print("Box_AP:", box_ap)
         print("Mask_AP:", mask_ap)
