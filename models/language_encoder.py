@@ -1,9 +1,5 @@
 from models.network_blocks import SA, AttFlat
 from utils.utils import make_mask
-from transformers import (
-    CLIPTokenizer,
-    CLIPTextModel
-)
 import torch.nn.functional as F
 import torch.nn as nn
 import torch
@@ -62,109 +58,8 @@ class LSTM_SA(nn.Module):
         }
 
 
-class CLIP_SA(nn.Module):
-
-    def __init__(self, __C, pretrained_emb=None, token_size=None):
-        super(CLIP_SA, self).__init__()
-
-        self.__C = __C
-
-        # =========================
-        # CLIP
-        # =========================
-        self.clip_name = __C.CLIP_MODEL
-
-        self.tokenizer = CLIPTokenizer.from_pretrained(
-            self.clip_name
-        )
-
-        self.text_encoder = CLIPTextModel.from_pretrained(
-            self.clip_name
-        )
-
-        self.clip_dim = self.text_encoder.config.hidden_size
-
-        # =========================
-        # projection
-        # =========================
-        self.proj = nn.Linear(
-            self.clip_dim,
-            __C.HIDDEN_SIZE
-        )
-
-        # =========================
-        # optional SA
-        # =========================
-        self.sa_list = nn.ModuleList(
-            [SA(__C) for _ in range(__C.N_SA)]
-        )
-
-        # self.gru = nn.GRU(input_size=self.clip_dim, hidden_size=self.clip_dim,
-        #                   num_layers=1, batch_first=True, bidirectional=True)
-
-        self.att_flat = AttFlat(__C)
-
-        # freeze clip encoder
-        if __C.EMBED_FREEZE:
-            self.freeze_module(self.text_encoder)
-
-    def freeze_module(self, module):
-        module.eval()
-        if getattr(module, 'module', False):
-            for child in module.module():
-                for param in child.parameters():
-                    param.requires_grad = False
-        else:
-            for param in module.parameters():
-                param.requires_grad = False
-
-    def forward(self, input_ids, attention_mask):
-
-        # device = next(self.parameters()).device
-        # input_ids = input_ids.to(device)
-
-        # attention_mask = attention_mask.to(device)
-
-        outputs = self.text_encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-
-        # lang_feat = outputs.last_hidden_state
-
-        # lang_feat, _ = self.gru(lang_feat)
-
-        # lang_feat = self.proj(lang_feat)
-        lang_feat = self.proj(outputs.last_hidden_state)
-
-        lang_feat_mask = (
-            attention_mask == 0
-        ).unsqueeze(1).unsqueeze(2)
-
-        for sa in self.sa_list:
-            lang_feat = sa(
-                lang_feat,
-                lang_feat_mask
-            )
-
-        flat_lang_feat = self.att_flat(lang_feat, lang_feat_mask)
-
-        # flat_lang_feat = lang_feat.mean(dim=1)
-        # flat_lang_feat = F.normalize(
-        #     flat_lang_feat,
-        #     dim=-1
-        # )
-
-        return {
-            'flat_lang_feat': flat_lang_feat,
-            'lang_feat': lang_feat,
-            'lang_feat_mask': lang_feat_mask
-        }
-
-
 backbone_dict = {
     'lstm': LSTM_SA,
-    'clip': CLIP_SA,
 }
 
 
