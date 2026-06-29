@@ -8,11 +8,12 @@ MODEL:
   MULTI_HEAD: 8
   FF_SIZE: 2048
   FLAT_GLIMPSES: 1
-  LANG_ENC: 'lstm'
+  LANG_ENC: 'clip'
+  CLIP_MODEL: 'openai/clip-vit-base-patch32'
   N_SA: 3
   VIS_ENC: 'yolov3'
   VIS_FREEZE: True
-  SELECT_NUM: 17
+  SELECT_NUM: 10
   CLASS_NUM: 80
   NUM_POINTS: 5
   WREC_DIM: 512
@@ -30,7 +31,7 @@ TRAIN:
   PRINT_FREQ: 100
   LOG_PATH: './logs/refcoco_weakmcn_tmp'
   LOG_IMAGE: False
-  PRETRAIN_WEIGHT: './yolov3_coco.pth'
+  PRETRAIN_WEIGHT: '/kaggle/input/models/pokabu1999/yolov3/pytorch/default/1/yolov3_coco.pth'
   RESUME_PATH: ''
   SCHEDULER: 'wcosine'
   MIN_LR: 0.00003

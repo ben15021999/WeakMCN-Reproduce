@@ -218,7 +218,7 @@ class Net(nn.Module):
             sam_feature = self.efficientsam.get_image_embeddings(
                 resized_image_feature_sam).to(x.device)
 
-        y_ = self.lang_encoder(y['input_ids'], y['attention_mask'])
+        y_ = self.lang_encoder(y)
 
         # Vision Multi Scale Fusion
         s, m, l = x_
@@ -314,7 +314,6 @@ class Net(nn.Module):
             predictions_list = [predictions_s]
             pred_boxes = self.get_boxes(
                 boxes_sml_new, predictions_list, self.class_num)
-            # pred_boxes = pred_boxes.cpu()
             pred_boxes = clip_boxes_to_image(pred_boxes, info_iter)
             prompt, pts_labels = self.generate_prompts(
                 pred_boxes, using_gt=False)

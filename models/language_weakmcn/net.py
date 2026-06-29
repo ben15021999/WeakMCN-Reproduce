@@ -1,4 +1,3 @@
-# coding=utf-8
 import torch
 import torch.nn as nn
 from models.language_encoder import language_encoder
@@ -11,7 +10,8 @@ from utils.utils import  clip_boxes_to_image
 import math
 import torch.nn.functional as F
 from transformers import Dinov2Model
-from models.language_guided_fusion import LanguageGuidedFusion
+from models.lgdf import LGDF
+import gc
 
 
 class PositionEmbeddingSine(nn.Module):
@@ -87,20 +87,15 @@ class Net(nn.Module):
         self.linear_dino_rec = nn.Linear(768, __C.WREC_DIM)
         self.linear_dino_res = nn.Linear(768, __C.WREC_DIM)
 
-        # self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
-        # self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
+        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
+        self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
 
-        self.linear_dino_rec = nn.Linear(768, __C.WREC_DIM)
-        self.linear_dino_res = nn.Linear(768, __C.WREC_DIM)
-
-        self.linear_sam_rec = nn.Linear(256, __C.WREC_DIM)
-        self.linear_sam_res = nn.Linear(256, __C.WREC_DIM)
-        ###########################################
-        # Residual Scale
-        ###########################################
-        self.rec_gamma = nn.Parameter(torch.tensor(0.1))
-        self.res_gamma = nn.Parameter(torch.tensor(0.1))
-        self._init_language_guided_fusion()
+        self.lgdf = LGDF(
+            anchor_dim=__C.WREC_DIM,
+            dino_dim=768,
+            hidden_dim=__C.HIDDEN_SIZE,
+            num_heads=8
+        )
 
         self.class_num = __C.CLASS_NUM
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
@@ -120,21 +115,6 @@ class Net(nn.Module):
         else:
             for param in module.parameters():
                 param.requires_grad = False
-
-    def _init_language_guided_fusion(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(
-                    m.weight,
-                    mode="fan_out",
-                    nonlinearity="relu"
-                )
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
 
     def reverse_normalization(self, x):
         # 原始标准化参数
@@ -227,17 +207,18 @@ class Net(nn.Module):
         x_input = [l, m, s]
         l_new, m_new, s_new = self.multi_scale_manner(x_input)
 
-        # # Dynamic routing
-        # rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
-        # res_feature = F.adaptive_avg_pool2d(l_new, (1, 1)).permute(0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
+        # Dynamic routing
+        rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
+        res_feature = F.adaptive_avg_pool2d(l_new, (1, 1)).permute(0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
 
         # load dino model
-        dino_feature = dino_feature[:, 1:, :]
-        dino_feature = dino_feature.transpose(1, 2).contiguous().view(dino_feature.size(0), dino_feature.size(2), 26, 26)
-        dino_feature_rec = F.avg_pool2d(dino_feature, kernel_size=2, stride=2)
-        dino_feature_res = F.interpolate(dino_feature, size=(52, 52), mode='bilinear', align_corners=False)
-        dino_feature_rec = self.linear_dino_rec(dino_feature_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        dino_feature_res = self.linear_dino_res(dino_feature_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        # dino_feature = dino_feature[:, 1:, :]
+        # dino_feature = dino_feature.transpose(1, 2).contiguous().view(dino_feature.size(0), dino_feature.size(2), 26, 26)
+        dino_tokens = dino_feature[:, 1:, :]
+        # dino_feature_rec = F.avg_pool2d(dino_feature, kernel_size=2, stride=2)
+        # dino_feature_res = F.interpolate(dino_feature, size=(52, 52), mode='bilinear', align_corners=False)
+        # dino_feature_rec = self.linear_dino_rec(dino_feature_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        # dino_feature_res = self.linear_dino_res(dino_feature_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         # load sam model
         sam_feature_rec = self.linear_sam_rec(sam_feature.permute(0, 2, 3, 1))
@@ -247,47 +228,17 @@ class Net(nn.Module):
         sam_feature_res = sam_feature_res.permute(0, 3, 1, 2)
         sam_feature_res = F.interpolate(sam_feature_res, size=(52, 52), mode='bilinear', align_corners=False)
 
-        # # Calculate the probability distribution of router_logits
-        # router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
-        # router_logits = torch.softmax(router_logits, dim=-1)
-        # s_new = s_new + dino_feature_rec * router_logits[:, 0][:, None, None, None] + sam_feature_rec * router_logits[:, 1][:, None, None, None]
-        # # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
+        # Calculate the probability distribution of router_logits
+        router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
+        router_logits = torch.softmax(router_logits, dim=-1)
+        s_new = s_new + dino_feature_rec * router_logits[:, 0][:, None, None, None] + sam_feature_rec * router_logits[:, 1][:, None, None, None]
+        # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
 
-        # # Calculate the probability distribution of router_logits
-        # router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
-        # router_logits = torch.softmax(router_logits, dim=-1)
-        # l_new = l_new + dino_feature_res * router_logits[:, 0][:, None, None, None] + sam_feature_res * router_logits[:, 1][:, None, None, None]
-        # # l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
-
-        ####################################################
-        # REC Fusion
-        ####################################################
-
-
-        rec_fused = self.rec_fusion(
-            yolo=s_new,
-            dino=dino_feature_rec,
-            sam=sam_feature_rec,
-            lang_feat=y_["lang_feat"],
-            lang_mask=y_["lang_feat_mask"]
-        )
-
-        s_new = s_new + self.rec_gamma * rec_fused
-        
-        ####################################################
-        # RES Fusion
-        ####################################################
-
-
-        res_fused = self.res_fusion(
-            yolo=l_new,
-            dino=dino_feature_res,
-            sam=sam_feature_res,
-            lang_feat=y_["lang_feat"],
-            lang_mask=y_["lang_feat_mask"]
-        )
-
-        l_new = l_new + self.res_gamma * res_fused
+        # Calculate the probability distribution of router_logits
+        router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
+        router_logits = torch.softmax(router_logits, dim=-1)
+        l_new = l_new + dino_feature_res * router_logits[:, 0][:, None, None, None] + sam_feature_res * router_logits[:, 1][:, None, None, None]
+        # l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
 
         x_ = [s_new, m_new, l_new]
 
@@ -303,7 +254,6 @@ class Net(nn.Module):
                 3).expand(bs, gridnum, anncornum, ch)).contiguous().view(bs, selnum, anncornum, ch)
         boxes_sml_new.append(box_sml_new)
         
-        # chỗ này gắn cái SAM2 vô để refine lại cái bbox
         batchsize, dim, h, w = x_[0].size()
         i_new = x_[0].view(batchsize, dim, h * w).permute(0, 2, 1)
         bs, gridnum, ch = i_new.shape
@@ -312,7 +262,13 @@ class Net(nn.Module):
             bool().unsqueeze(2).expand(bs, gridnum, ch)).contiguous().view(bs, selnum, ch)
 
         # Anchor-based Contrastive Learning
-        x_new = self.linear_vs(i_new)
+        # x_new = self.linear_vs(i_new)
+        x_new, attn = self.lgdf(
+            anchor_feature=i_new,
+            dino_tokens=dino_tokens,
+            text_feature=y_["flat_lang_feat"]
+
+        )
         position_embedding = self.get_position_embedding(boxes_sml_new[0])
         x_new = x_new + position_embedding
         y_new = self.linear_ts(y_['flat_lang_feat'].unsqueeze(1))
