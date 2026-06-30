@@ -7,6 +7,7 @@ from transformers import CLIPTextModelWithProjection as CLIPTP
 from transformers import (AutoTokenizer, AutoProcessor,
                           AutoModel, CLIPTextConfig)
 
+
 class LSTM_SA(nn.Module):
     def __init__(self, __C, pretrained_emb, token_size):
         super(LSTM_SA, self).__init__()
@@ -80,8 +81,9 @@ class CLIP_SA(nn.Module):
         clip_config = CLIPTextConfig.from_pretrained(self.clip_name,
                                                      attention_dropout=dropout)
 
-        self.text_encoder = CLIPTextModel.from_pretrained(
-            self.clip_name
+        self.text_encoder = CLIPTP.from_pretrained(
+            self.clip_name,
+            config=clip_config
         )
 
         self.clip_dim = self.text_encoder.config.hidden_size
@@ -126,7 +128,6 @@ class CLIP_SA(nn.Module):
             outputs = self.text_encoder(**inputs)
 
         lang_feat = outputs.last_hidden_state
-
 
         flat_lang_feat = outputs.text_embeds
 

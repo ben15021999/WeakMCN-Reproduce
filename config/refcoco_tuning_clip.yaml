@@ -1,5 +1,5 @@
 MODEL:
-  MODEL: 'language_weakmcn'
+  MODEL: 'weakmcn_clip'
   USE_GLOVE: True
   WORD_EMBED_SIZE: 300
   EMBED_FREEZE: True

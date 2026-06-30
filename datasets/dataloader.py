@@ -3,10 +3,9 @@ import spacy
 import re
 import json
 from utils.utils import label2yolobox
-from transformers import (AutoTokenizer, CLIPTextConfig)
-from transformers import CLIPTextModelWithProjection as CLIPTP
-from torchvision.transforms import transforms
+from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
+from torchvision.transforms import transforms
 import torch.utils.data as Data
 import torch
 import numpy as np
@@ -235,10 +234,6 @@ class RefCOCODataSet(Data.Dataset):
             __C.CLIP_MODEL
         )
 
-        clip_config = CLIPTextConfig.from_pretrained(__C.CLIP_MODEL,
-                                                     attention_dropout=__C.DROPOUT_R)
-        self.model = CLIPTP.from_pretrained(__C.CLIP_MODEL, config=clip_config)
-
         print('Using CLIP tokenizer:', __C.CLIP_MODEL)
 
         self.candidate_transforms = {}
@@ -305,17 +300,17 @@ class RefCOCODataSet(Data.Dataset):
         #         break
 
         # return ques_ix
-        num_per_batch = [len(t) for t in ref]
-        text_mask = torch.tensor([x != self.pad_value for x in ref],
-                                 requires_grad=False).to(self.model.device)
         inputs = self.tokenizer(
             ref,
-            padding=True,
+            padding='max_length',
             truncation=True,
             return_tensors='pt'
         )
 
-        return inputs
+        return {
+            "input_ids": inputs["input_ids"].squeeze(0),
+            "attention_mask": inputs["attention_mask"].squeeze(0),
+        }
 
     def load_refs(self, idx):
         refs = self.refs_anno[idx]['refs']

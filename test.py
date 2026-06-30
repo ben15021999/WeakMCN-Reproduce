@@ -102,11 +102,11 @@ def validate_box_and_mask(__C,
             ref_iter, image_iter, mask_iter, box_iter, gt_box_iter, mask_id, info_iter, ref_txt, img_path = data
             # print(ref_txt)
             mask_iter = mask_iter.cuda(non_blocking=True)
-            ref_iter = ref_iter.cuda(non_blocking=True)
-            # ref_iter = {
-            #     k: v.cuda(non_blocking=True)
-            #     for k, v in ref_iter.items()
-            # }
+            # ref_iter = ref_iter.cuda(non_blocking=True)
+            ref_iter = {
+                k: v.cuda(non_blocking=True)
+                for k, v in ref_iter.items()
+            }
             image_iter = image_iter.cuda(non_blocking=True)
             box_iter = box_iter.cuda(non_blocking=True)
             info_iter = info_iter.cuda(non_blocking=True)

@@ -59,7 +59,11 @@ def train_one_epoch(__C,
         # print(ref_txt)
         mask_iter = mask_iter.cuda(non_blocking=True)
         info_iter = info_iter.cuda(non_blocking=True)
-        ref_iter = ref_iter.cuda(non_blocking=True)
+        # ref_iter = ref_iter.cuda(non_blocking=True)
+        ref_iter = {
+            k: v.cuda(non_blocking=True)
+            for k, v in ref_iter.items()
+        }
         image_iter = image_iter.cuda(non_blocking=True)
         box_iter = box_iter.cuda(non_blocking=True)
 
@@ -196,8 +200,8 @@ def main_worker(gpu, __C):
 
     net = ModelLoader(__C).Net(
         __C,
-        train_set.pretrained_emb,
-        train_set.token_size
+        None,
+        None
     )
     # optimizer
     params = filter(lambda p: p.requires_grad,
@@ -296,7 +300,7 @@ def main_worker(gpu, __C):
                         train_loader, scalar, writer, ith_epoch, gpu, ema)
         # box_ap = validate(__C, net, val_loader, writer, ith_epoch, gpu, val_set.ix_to_token, save_ids=save_ids,
         #                            ema=ema)
-        box_ap, mask_ap = validate_box_and_mask(__C, net, val_loader, writer, ith_epoch, gpu, val_set.ix_to_token,
+        box_ap, mask_ap = validate_box_and_mask(__C, net, val_loader, writer, ith_epoch, gpu, None,
                                                 save_ids=save_ids,
                                                 ema=ema)
         best_det_acc_list.append(box_ap)
