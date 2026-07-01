@@ -86,7 +86,7 @@ class Net(nn.Module):
         self.res_proj = nn.Conv2d(
             512,
             __C.WRES_DIM,
-            kernel_size=1
+            kernel_size=2
         )
 
         # load ESAM model
@@ -297,18 +297,20 @@ class Net(nn.Module):
         x_new = x_new + position_embedding
         y_new = self.linear_ts(y_['flat_lang_feat'].unsqueeze(1))
 
-        # x_sup = [l_new, m_new, s_new]
-        x_sup = [
-            self.res_proj(l_new),
-            self.res_proj(m_new),
-            self.res_proj(s_new)
-        ]
-        # for i in range(len(self.fusion_manner)):
-        #     x_sup[i] = self.fusion_manner[i](x_sup[i], y_['flat_lang_feat'])
+        x_sup = [l_new, m_new, s_new]
+        # x_sup = [
+        #     self.res_proj(l_new),
+        #     self.res_proj(m_new),
+        #     self.res_proj(s_new)
+        # ]
+        for i in range(len(self.fusion_manner)):
+            x_sup[i] = self.fusion_manner[i](x_sup[i], y_['flat_lang_feat'])
         x_sup = self.multi_scale_manner_sup(x_sup)
         seg_emb, _, _ = self.attention_manner(y_['flat_lang_feat'], x_sup[0])
 
         if self.training:
+            x_new = F.normalize(x_new, dim=-1)
+            y_new = F.normalize(y_new, dim=-1)
             loss_det = self.head(x_new, y_new)
             predictions_s = self.head.getPrediction(x_new, y_new)
             predictions_list = [predictions_s]
@@ -325,6 +327,8 @@ class Net(nn.Module):
                 seg_emb, box_gt, predict_masks, pred_boxes, epoch)
             return loss_det, loss_seg
         else:
+            x_new = F.normalize(x_new, dim=-1)
+            y_new = F.normalize(y_new, dim=-1)
             predictions_s = self.head(x_new, y_new)
             predictions_list = [predictions_s]
             box_pred = self.get_boxes(

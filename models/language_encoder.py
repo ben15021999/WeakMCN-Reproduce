@@ -128,13 +128,31 @@ class CLIP_SA(nn.Module):
             outputs = self.text_encoder(**inputs)
 
         lang_feat = outputs.last_hidden_state
+        lang_feat = self.proj(lang_feat)
 
-        flat_lang_feat = outputs.text_embeds
+        # lang_feat_mask = inputs["attention_mask"]
+        # lang_feat_mask = make_mask(ques_ix.unsqueeze(2))
+        lang_feat_mask = ~inputs["attention_mask"].bool().unsqueeze(1).unsqueeze(2)
 
+        for sa in self.sa_list:
+            lang_feat = sa(lang_feat, lang_feat_mask)
+
+        flat_lang_feat = self.att_flat(
+            lang_feat,
+            lang_feat_mask
+        )
+
+        # flat_lang_feat = outputs.text_embeds
+
+        # return {
+        #     'flat_lang_feat': flat_lang_feat,
+        #     'lang_feat': lang_feat,
+        #     'lang_feat_mask': inputs["attention_mask"]
+        # }
         return {
-            'flat_lang_feat': flat_lang_feat,
-            'lang_feat': lang_feat,
-            'lang_feat_mask': inputs["attention_mask"]
+            "flat_lang_feat": flat_lang_feat,
+            "lang_feat": lang_feat,
+            "lang_feat_mask": lang_feat_mask
         }
 
 
