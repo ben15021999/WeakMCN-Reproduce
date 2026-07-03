@@ -10,8 +10,7 @@ from utils.utils import  clip_boxes_to_image
 import math
 import torch.nn.functional as F
 from transformers import Dinov2Model
-from models.lgdf import LGDF
-import gc
+from models.language_adapter import LanguageGuidedAdapter
 
 
 class PositionEmbeddingSine(nn.Module):
@@ -90,11 +89,11 @@ class Net(nn.Module):
         self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
         self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
 
-        self.lgdf = LGDF(
-            anchor_dim=__C.WREC_DIM,
-            dino_dim=768,
-            hidden_dim=__C.HIDDEN_SIZE,
-            num_heads=8
+        self.language_adapter = LanguageGuidedAdapter(
+            visual_dim=__C.WREC_DIM,
+            lang_dim=__C.HIDDEN_SIZE,
+            num_heads=8,
+            dropout=0.1
         )
 
         self.class_num = __C.CLASS_NUM
@@ -207,18 +206,38 @@ class Net(nn.Module):
         x_input = [l, m, s]
         l_new, m_new, s_new = self.multi_scale_manner(x_input)
 
+        lang = y_["lang_feat"]
+        lang_mask = y_["lang_feat_mask"]
+
+        s_new = self.language_adapter(
+            s_new,
+            lang,
+            lang_mask
+        )
+
+        m_new = self.language_adapter(
+            m_new,
+            lang,
+            lang_mask
+        )
+
+        l_new = self.language_adapter(
+            l_new,
+            lang,
+            lang_mask
+        )
+
         # Dynamic routing
         rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
         res_feature = F.adaptive_avg_pool2d(l_new, (1, 1)).permute(0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
 
         # load dino model
-        # dino_feature = dino_feature[:, 1:, :]
-        # dino_feature = dino_feature.transpose(1, 2).contiguous().view(dino_feature.size(0), dino_feature.size(2), 26, 26)
-        dino_tokens = dino_feature[:, 1:, :]
-        # dino_feature_rec = F.avg_pool2d(dino_feature, kernel_size=2, stride=2)
-        # dino_feature_res = F.interpolate(dino_feature, size=(52, 52), mode='bilinear', align_corners=False)
-        # dino_feature_rec = self.linear_dino_rec(dino_feature_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        # dino_feature_res = self.linear_dino_res(dino_feature_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        dino_feature = dino_feature[:, 1:, :]
+        dino_feature = dino_feature.transpose(1, 2).contiguous().view(dino_feature.size(0), dino_feature.size(2), 26, 26)
+        dino_feature_rec = F.avg_pool2d(dino_feature, kernel_size=2, stride=2)
+        dino_feature_res = F.interpolate(dino_feature, size=(52, 52), mode='bilinear', align_corners=False)
+        dino_feature_rec = self.linear_dino_rec(dino_feature_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        dino_feature_res = self.linear_dino_res(dino_feature_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         # load sam model
         sam_feature_rec = self.linear_sam_rec(sam_feature.permute(0, 2, 3, 1))
@@ -262,13 +281,7 @@ class Net(nn.Module):
             bool().unsqueeze(2).expand(bs, gridnum, ch)).contiguous().view(bs, selnum, ch)
 
         # Anchor-based Contrastive Learning
-        # x_new = self.linear_vs(i_new)
-        x_new, attn = self.lgdf(
-            anchor_feature=i_new,
-            dino_tokens=dino_tokens,
-            text_feature=y_["flat_lang_feat"]
-
-        )
+        x_new = self.linear_vs(i_new)
         position_embedding = self.get_position_embedding(boxes_sml_new[0])
         x_new = x_new + position_embedding
         y_new = self.linear_ts(y_['flat_lang_feat'].unsqueeze(1))
