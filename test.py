@@ -29,8 +29,7 @@ def draw_box(image, bbox, color):
     # color: bgr
     # bbox: [x1, y1, x2, y2]
     thickness = 2
-    image = cv2.rectangle(
-        image, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color=color, thickness=thickness)
+    image = cv2.rectangle(image, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color=color, thickness=thickness)
     return image
 
 
@@ -90,11 +89,9 @@ def validate_box_and_mask(__C,
     for item in np.arange(0.5, 1, 0.05):
         mask_aps[item] = []
     # meters = [batch_time, data_time, losses, box_ap]
-    meters = [batch_time, data_time, losses,
-              box_ap, mask_ap, inconsistency_error]
+    meters = [batch_time, data_time, losses, box_ap, mask_ap, inconsistency_error]
     meters_dict = {meter.name: meter for meter in meters}
-    progress = ProgressMeter(__C.VERSION, __C.EPOCHS, len(
-        loader), meters, prefix=prefix + ': ')
+    progress = ProgressMeter(__C.VERSION, __C.EPOCHS, len(loader), meters, prefix=prefix + ': ')
     with th.no_grad():
         end = time.time()
         for ith_batch, data in enumerate(loader):
@@ -102,17 +99,11 @@ def validate_box_and_mask(__C,
             ref_iter, image_iter, mask_iter, box_iter, gt_box_iter, mask_id, info_iter, ref_txt, img_path = data
             # print(ref_txt)
             mask_iter = mask_iter.cuda(non_blocking=True)
-            # ref_iter = ref_iter.cuda(non_blocking=True)
-            ref_iter = {
-                k: v.cuda(non_blocking=True)
-                for k, v in ref_iter.items()
-            }
+            ref_iter = ref_iter.cuda(non_blocking=True)
             image_iter = image_iter.cuda(non_blocking=True)
             box_iter = box_iter.cuda(non_blocking=True)
-            info_iter = info_iter.cuda(non_blocking=True)
             gt_box_iter = gt_box_iter.cuda(non_blocking=True)
-            box, mask = net(image_iter, ref_iter, box_gt=box_iter,
-                            mask_gt=mask_iter, info_iter=info_iter)
+            box, mask = net(image_iter, ref_iter, box_gt=box_iter, mask_gt=mask_iter, info_iter=info_iter)
 
             # timelist = []
             # for i in range(100):
@@ -133,10 +124,8 @@ def validate_box_and_mask(__C,
             for i in range(len(gt_box_iter)):
                 # Adjust the horizontal and vertical coordinates based on the resized dimensions.
                 box[i] = yolobox2label(box[i], info_iter[i])
-            box_iou = batch_box_iou(torch.from_numpy(
-                gt_box_iter), torch.from_numpy(box)).cpu().numpy()
-            box_ap.update((box_iou > 0.5).astype(
-                np.float32).mean() * 100., box_iou.shape[0])
+            box_iou = batch_box_iou(torch.from_numpy(gt_box_iter), torch.from_numpy(box)).cpu().numpy()
+            box_ap.update((box_iou > 0.5).astype(np.float32).mean() * 100., box_iou.shape[0])
 
             seg_iou = []
             mask = mask.cpu().numpy().astype(np.uint8)
@@ -149,8 +138,7 @@ def validate_box_and_mask(__C,
                         if ix > 0:
                             words.append(ix_to_token[ix])
                     sent = ' '.join(words)
-                    box_iter = box_iter.view(
-                        box_iter.shape[0], -1) * __C.INPUT_SHAPE[0]
+                    box_iter = box_iter.view(box_iter.shape[0], -1) * __C.INPUT_SHAPE[0]
                     box_iter[:, 0] = box_iter[:, 0] - 0.5 * box_iter[:, 2]
                     box_iter[:, 1] = box_iter[:, 1] - 0.5 * box_iter[:, 3]
                     box_iter[:, 2] = box_iter[:, 0] + box_iter[:, 2]
@@ -164,8 +152,7 @@ def validate_box_and_mask(__C,
 
                 # from pydensecrf import densecrf
 
-                mask_gt = np.load(os.path.join(
-                    __C.MASK_PATH[__C.DATASET], '%d.npy' % mask_id[i]))
+                mask_gt = np.load(os.path.join(__C.MASK_PATH[__C.DATASET], '%d.npy' % mask_id[i]))
                 mask_pred = mask_processing(mask_pred, info_iter[i])
 
                 single_seg_iou, single_seg_ap = mask_iou(mask_gt, mask_pred)
@@ -176,8 +163,7 @@ def validate_box_and_mask(__C,
             ie = (box_iou >= 0.5).astype(np.float32) * (seg_iou < 0.5).astype(np.float32) + (box_iou < 0.5).astype(
                 np.float32) * (seg_iou >= 0.5).astype(np.float32)
             inconsistency_error.update(ie.mean() * 100., ie.shape[0])
-            box_ap.update((box_iou > 0.5).astype(
-                np.float32).mean() * 100., box_iou.shape[0])
+            box_ap.update((box_iou > 0.5).astype(np.float32).mean() * 100., box_iou.shape[0])
             mask_ap.update(seg_iou.mean() * 100., seg_iou.shape[0])
 
             reduce_meters(meters_dict, rank, __C)
@@ -187,15 +173,11 @@ def validate_box_and_mask(__C,
             end = time.time()
 
         if main_process(__C, rank) and writer is not None:
-            writer.add_scalar("Acc/BoxIoU@0.5",
-                              box_ap.avg_reduce, global_step=epoch)
-            writer.add_scalar(
-                "Acc/MaskIoU", mask_ap.avg_reduce, global_step=epoch)
-            writer.add_scalar(
-                "Acc/IE", inconsistency_error.avg_reduce, global_step=epoch)
+            writer.add_scalar("Acc/BoxIoU@0.5", box_ap.avg_reduce, global_step=epoch)
+            writer.add_scalar("Acc/MaskIoU", mask_ap.avg_reduce, global_step=epoch)
+            writer.add_scalar("Acc/IE", inconsistency_error.avg_reduce, global_step=epoch)
             for item in mask_aps:
-                writer.add_scalar(
-                    "Acc/MaskIoU@%.2f" % item, np.array(mask_aps[item]).mean(), global_step=epoch)
+                writer.add_scalar("Acc/MaskIoU@%.2f" % item, np.array(mask_aps[item]).mean(), global_step=epoch)
     if ema is not None:
         ema.restore()
     return box_ap.avg_reduce, mask_ap.avg_reduce
@@ -222,8 +204,7 @@ def validate(__C,
     box_ap = AverageMeter('BoxIoU@0.5', ':6.2f')
     meters = [batch_time, data_time, losses, box_ap]
     meters_dict = {meter.name: meter for meter in meters}
-    progress = ProgressMeter(__C.VERSION, __C.EPOCHS, len(
-        loader), meters, prefix=prefix + ': ')
+    progress = ProgressMeter(__C.VERSION, __C.EPOCHS, len(loader), meters, prefix=prefix + ': ')
     with th.no_grad():
         end = time.time()
         for ith_batch, data in enumerate(loader):
@@ -231,13 +212,12 @@ def validate(__C,
             ref_iter, image_iter, mask_iter, box_iter, gt_box_iter, mask_id, info_iter, ref_txt, img_path = data
             # print(ref_txt)
             # mask_iter = mask_iter.cuda(non_blocking=True)
-            # ref_iter = ref_iter.cuda(non_blocking=True)
+            ref_iter = ref_iter.cuda(non_blocking=True)
             image_iter = image_iter.cuda(non_blocking=True)
             box_iter = box_iter.cuda(non_blocking=True)
             gt_box_iter = gt_box_iter.cuda(non_blocking=True)
 
-            box, _ = net(image_iter, ref_iter,
-                         __C.USING_CHECKPOINT, gt_box_iter, info_iter)
+            box, _ = net(image_iter, ref_iter, __C.USING_CHECKPOINT, gt_box_iter, info_iter)
             ######## Visualization ##########
             # box = box.squeeze(1)
             # # box = net(image_iter, ref_iter)  # [left_bottom_x, left_bottom_y, right_top_x, right_top_y]
@@ -263,7 +243,7 @@ def validate(__C,
             gt_box_iter[:, 2] = (gt_box_iter[:, 0] + gt_box_iter[:, 2])
             gt_box_iter[:, 3] = (gt_box_iter[:, 1] + gt_box_iter[:, 3])
             gt_box_iter = gt_box_iter.cpu().numpy()
-            # info_iter = info_iter.cpu().numpy()
+            info_iter = info_iter.cpu().numpy()
             box = box.squeeze(1).cpu().numpy()
             ######## Visualization ##########
             # for j in range(gt_box_iter.shape[0]):
@@ -278,10 +258,8 @@ def validate(__C,
             for i in range(len(gt_box_iter)):
                 # Adjust the horizontal and vertical coordinates based on the resized dimensions.
                 box[i] = yolobox2label(box[i], info_iter[i])
-            box_iou = batch_box_iou(torch.from_numpy(
-                gt_box_iter), torch.from_numpy(box)).cpu().numpy()
-            box_ap.update((box_iou > 0.5).astype(
-                np.float32).mean() * 100., box_iou.shape[0])
+            box_iou = batch_box_iou(torch.from_numpy(gt_box_iter), torch.from_numpy(box)).cpu().numpy()
+            box_ap.update((box_iou > 0.5).astype(np.float32).mean() * 100., box_iou.shape[0])
 
             reduce_meters(meters_dict, rank, __C)
             if (ith_batch % __C.PRINT_FREQ == 0 or ith_batch == (len(loader) - 1)) and main_process(__C, rank):
@@ -290,8 +268,7 @@ def validate(__C,
             end = time.time()
 
         if main_process(__C, rank) and writer is not None:
-            writer.add_scalar("Acc/BoxIoU@0.5",
-                              box_ap.avg_reduce, global_step=epoch)
+            writer.add_scalar("Acc/BoxIoU@0.5", box_ap.avg_reduce, global_step=epoch)
     if ema is not None:
         ema.restore()
     return box_ap.avg_reduce
@@ -309,8 +286,7 @@ def main_worker(gpu, __C):
                                 rank=__C.RANK)
 
     train_set = RefCOCODataSet(__C, split='train')
-    train_loader = loader(__C, train_set, gpu, shuffle=(
-        not __C.MULTIPROCESSING_DISTRIBUTED))
+    train_loader = loader(__C, train_set, gpu, shuffle=(not __C.MULTIPROCESSING_DISTRIBUTED))
 
     loaders = []
     prefixs = ['val']
@@ -338,8 +314,7 @@ def main_worker(gpu, __C):
 
     # optimizer
     std_optim = getattr(Optim, __C.OPT)
-    params = filter(lambda p: p.requires_grad,
-                    net.parameters())  # split_weights(net)
+    params = filter(lambda p: p.requires_grad, net.parameters())  # split_weights(net)
     eval_str = 'params, lr=%f' % __C.LR
     for key in __C.OPT_PARAMS:
         eval_str += ' ,' + key + '=' + str(__C.OPT_PARAMS[key])
@@ -356,14 +331,11 @@ def main_worker(gpu, __C):
         print(__C)
         total = sum([param.nelement() for param in net.parameters()])
         print('  + Number of all params: %.2fM' % (total / 1e6))  # 每一百万为一个单位
-        total = sum([param.nelement()
-                    for param in net.parameters() if param.requires_grad])
-        print('  + Number of trainable params: %.2fM' %
-              (total / 1e6))  # 每一百万为一个单位
+        total = sum([param.nelement() for param in net.parameters() if param.requires_grad])
+        print('  + Number of trainable params: %.2fM' % (total / 1e6))  # 每一百万为一个单位
 
     if os.path.isfile(__C.RESUME_PATH):
-        checkpoint = torch.load(
-            __C.RESUME_PATH, map_location=lambda storage, loc: storage.cuda())
+        checkpoint = torch.load(__C.RESUME_PATH, map_location=lambda storage, loc: storage.cuda())
         new_dict = {}
         for k in checkpoint['state_dict']:
             if 'module.' in k:
@@ -385,16 +357,14 @@ def main_worker(gpu, __C):
     else:
         scalar = None
 
-    SAVE_PATH = os.path.join(__C.LOG_PATH, __C.MODEL,
-                             'seed_{}'.format(__C.SEED), str(__C.VERSION))
+    SAVE_PATH = os.path.join(__C.LOG_PATH, __C.MODEL, 'seed_{}'.format(__C.SEED), str(__C.VERSION))
     if main_process(__C, gpu):
         writer = SummaryWriter(log_dir=SAVE_PATH)
         # writer = SummaryWriter(log_dir=os.path.join(__C.LOG_PATH, str(__C.VERSION)))
     else:
         writer = None
 
-    save_ids = np.random.randint(
-        1, len(val_loader) * __C.BATCH_SIZE, 100) if __C.LOG_IMAGE else None
+    save_ids = np.random.randint(1, len(val_loader) * __C.BATCH_SIZE, 100) if __C.LOG_IMAGE else None
     for loader_, prefix_ in zip(loaders, prefixs):
         box_ap, mask_ap = validate_box_and_mask(__C, net, loader_, writer, 0, gpu, val_set.ix_to_token,
                                                 save_ids=save_ids, prefix=prefix_)
@@ -415,8 +385,7 @@ def main():
     N_GPU = len(__C.GPU)
     __C.RESUME_PATH = args.eval_weights
 
-    SAVE_PATH = os.path.join(__C.LOG_PATH, __C.MODEL,
-                             'seed_{}'.format(__C.SEED), str(__C.VERSION))
+    SAVE_PATH = os.path.join(__C.LOG_PATH, __C.MODEL, 'seed_{}'.format(__C.SEED), str(__C.VERSION))
     if not os.path.exists(SAVE_PATH):
         os.makedirs(os.path.join(SAVE_PATH, 'ckpt'), exist_ok=True)
     # if not os.path.exists(os.path.join(__C.LOG_PATH, str(__C.VERSION))):
