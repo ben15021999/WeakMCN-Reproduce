@@ -11,6 +11,7 @@ import math
 import torch.nn.functional as F
 from transformers import Dinov2Model
 from models.language_adapter import LanguageGuidedAdapter
+import gc
 
 
 class PositionEmbeddingSine(nn.Module):
@@ -226,6 +227,9 @@ class Net(nn.Module):
             lang,
             lang_mask
         )
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Dynamic routing
         rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
