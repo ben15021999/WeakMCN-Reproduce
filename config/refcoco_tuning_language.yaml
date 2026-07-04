@@ -11,6 +11,7 @@ MODEL:
   N_SA: 3
   VIS_ENC: 'yolov3'
   VIS_FREEZE: True
+  LANG_ENC: 'lstm'
   SELECT_NUM: 10
   CLASS_NUM: 80
   NUM_POINTS: 5
@@ -21,7 +22,7 @@ MODEL:
 
 TRAIN:
   GPU: [0]
-  BATCH_SIZE: 15 # total batch size on a single node if multiprocessing_distributed else batch size on one gpu
+  BATCH_SIZE: 20 # total batch size on a single node if multiprocessing_distributed else batch size on one gpu
   NUM_WORKER: 4 # same as BATCH_SIZE
   LR: 0.0001
   EPOCHS: 25

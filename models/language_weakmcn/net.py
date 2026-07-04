@@ -10,9 +10,6 @@ from utils.utils import  clip_boxes_to_image
 import math
 import torch.nn.functional as F
 from transformers import Dinov2Model
-from models.language_adapter import LanguageGuidedAdapter
-import gc
-
 
 class PositionEmbeddingSine(nn.Module):
     """
@@ -87,15 +84,27 @@ class Net(nn.Module):
         self.linear_dino_rec = nn.Linear(768, __C.WREC_DIM)
         self.linear_dino_res = nn.Linear(768, __C.WREC_DIM)
 
-        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
-        self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
+        # self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
+        # self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
+        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 3)
+        self.linear_router_res = nn.Linear(__C.WREC_DIM, 3)
 
-        self.language_adapter = LanguageGuidedAdapter(
-            visual_dim=__C.WREC_DIM,
-            lang_dim=__C.HIDDEN_SIZE,
-            num_heads=8,
-            dropout=0.1
-        )
+        # chuẩn hóa expert trước khi cộng
+        self.norm_dino_rec = nn.LayerNorm(__C.WREC_DIM)
+        self.norm_sam_rec = nn.LayerNorm(__C.WREC_DIM)
+        self.norm_dino_res = nn.LayerNorm(__C.WREC_DIM)
+        self.norm_sam_res = nn.LayerNorm(__C.WREC_DIM)
+
+        # temperature học được, giúp softmax mềm lúc đầu
+        self.router_temp_rec = nn.Parameter(torch.tensor(1.5))
+        self.router_temp_res = nn.Parameter(torch.tensor(1.5))
+
+        # khởi tạo bias ưu tiên backbone
+        nn.init.constant_(self.linear_router_rec.bias, 0.0)
+        nn.init.constant_(self.linear_router_res.bias, 0.0)
+        with torch.no_grad():
+            self.linear_router_rec.bias[0] = 1.0
+            self.linear_router_res.bias[0] = 1.0
 
         self.class_num = __C.CLASS_NUM
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
@@ -207,61 +216,96 @@ class Net(nn.Module):
         x_input = [l, m, s]
         l_new, m_new, s_new = self.multi_scale_manner(x_input)
 
-        lang = y_["lang_feat"]
-        lang_mask = y_["lang_feat_mask"]
+        # # Dynamic routing
+        # rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
+        # res_feature = F.adaptive_avg_pool2d(l_new, (1, 1)).permute(0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
 
-        s_new = self.language_adapter(
-            s_new,
-            lang,
-            lang_mask
-        )
+        # # load dino model
+        # dino_feature = dino_feature[:, 1:, :]
+        # dino_feature = dino_feature.transpose(1, 2).contiguous().view(dino_feature.size(0), dino_feature.size(2), 26, 26)
+        # dino_feature_rec = F.avg_pool2d(dino_feature, kernel_size=2, stride=2)
+        # dino_feature_res = F.interpolate(dino_feature, size=(52, 52), mode='bilinear', align_corners=False)
+        # dino_feature_rec = self.linear_dino_rec(dino_feature_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        # dino_feature_res = self.linear_dino_res(dino_feature_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
-        m_new = self.language_adapter(
-            m_new,
-            lang,
-            lang_mask
-        )
+        # # load sam model
+        # sam_feature_rec = self.linear_sam_rec(sam_feature.permute(0, 2, 3, 1))
+        # sam_feature_rec = sam_feature_rec.permute(0, 3, 1, 2)
+        # sam_feature_rec = F.avg_pool2d(sam_feature_rec, kernel_size=2, stride=2)
+        # sam_feature_res = self.linear_sam_res(sam_feature.permute(0, 2, 3, 1))
+        # sam_feature_res = sam_feature_res.permute(0, 3, 1, 2)
+        # sam_feature_res = F.interpolate(sam_feature_res, size=(52, 52), mode='bilinear', align_corners=False)
 
-        l_new = self.language_adapter(
-            l_new,
-            lang,
-            lang_mask
-        )
+        # # Calculate the probability distribution of router_logits
+        # router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
+        # router_logits = torch.softmax(router_logits, dim=-1)
+        # s_new = s_new + dino_feature_rec * router_logits[:, 0][:, None, None, None] + sam_feature_rec * router_logits[:, 1][:, None, None, None]
+        # # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
 
-        gc.collect()
-        torch.cuda.empty_cache()
 
-        # Dynamic routing
-        rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
-        res_feature = F.adaptive_avg_pool2d(l_new, (1, 1)).permute(0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
+        # # Calculate the probability distribution of router_logits
+        # router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
+        # router_logits = torch.softmax(router_logits, dim=-1)
+        # l_new = l_new + dino_feature_res * router_logits[:, 0][:, None, None, None] + sam_feature_res * router_logits[:, 1][:, None, None, None]
+        # # l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
+        # Dynamic routing - 3 expert residual
+        rec_feature = F.adaptive_avg_pool2d(
+            s_new, (1, 1)).flatten(1)  # [B, C] KHÔNG detach
+        res_feature = F.adaptive_avg_pool2d(l_new, (1, 1)).flatten(1)
 
         # load dino model
         dino_feature = dino_feature[:, 1:, :]
-        dino_feature = dino_feature.transpose(1, 2).contiguous().view(dino_feature.size(0), dino_feature.size(2), 26, 26)
+        dino_feature = dino_feature.transpose(1, 2).contiguous().view(
+            dino_feature.size(0), dino_feature.size(2), 26, 26)
         dino_feature_rec = F.avg_pool2d(dino_feature, kernel_size=2, stride=2)
-        dino_feature_res = F.interpolate(dino_feature, size=(52, 52), mode='bilinear', align_corners=False)
-        dino_feature_rec = self.linear_dino_rec(dino_feature_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        dino_feature_res = self.linear_dino_res(dino_feature_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        dino_feature_res = F.interpolate(dino_feature, size=(
+            52, 52), mode='bilinear', align_corners=False)
+        dino_feature_rec = self.linear_dino_rec(
+            dino_feature_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        dino_feature_res = self.linear_dino_res(
+            dino_feature_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         # load sam model
-        sam_feature_rec = self.linear_sam_rec(sam_feature.permute(0, 2, 3, 1))
-        sam_feature_rec = sam_feature_rec.permute(0, 3, 1, 2)
+        sam_feature_rec = self.linear_sam_rec(
+            sam_feature.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         sam_feature_rec = F.avg_pool2d(sam_feature_rec, kernel_size=2, stride=2)
-        sam_feature_res = self.linear_sam_res(sam_feature.permute(0, 2, 3, 1))
-        sam_feature_res = sam_feature_res.permute(0, 3, 1, 2)
-        sam_feature_res = F.interpolate(sam_feature_res, size=(52, 52), mode='bilinear', align_corners=False)
+        sam_feature_res = self.linear_sam_res(
+            sam_feature.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        sam_feature_res = F.interpolate(sam_feature_res, size=(
+            52, 52), mode='bilinear', align_corners=False)
 
-        # Calculate the probability distribution of router_logits
-        router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
-        router_logits = torch.softmax(router_logits, dim=-1)
-        s_new = s_new + dino_feature_rec * router_logits[:, 0][:, None, None, None] + sam_feature_rec * router_logits[:, 1][:, None, None, None]
-        # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
+        # chuẩn hóa expert
+        dino_rec_n = self.norm_dino_rec(
+            dino_feature_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        sam_rec_n = self.norm_sam_rec(
+            sam_feature_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        dino_res_n = self.norm_dino_res(
+            dino_feature_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        sam_res_n = self.norm_sam_res(
+            sam_feature_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
-        # Calculate the probability distribution of router_logits
-        router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
-        router_logits = torch.softmax(router_logits, dim=-1)
-        l_new = l_new + dino_feature_res * router_logits[:, 0][:, None, None, None] + sam_feature_res * router_logits[:, 1][:, None, None, None]
-        # l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
+        # router REC
+        logits_rec = self.linear_router_rec(rec_feature)  # [B,3]
+        weights_rec = F.softmax(logits_rec / self.router_temp_rec, dim=-1)
+        w_r0 = weights_rec[:, 0, None, None, None]
+        w_r1 = weights_rec[:, 1, None, None, None]
+        w_r2 = weights_rec[:, 2, None, None, None]
+        # residual: giữ backbone nguyên, cộng thêm 2 expert có trọng số
+        s_new = s_new + w_r1 * dino_rec_n + w_r2 * sam_rec_n
+
+        # router RES
+        logits_res = self.linear_router_res(res_feature)
+        weights_res = F.softmax(logits_res / self.router_temp_res, dim=-1)
+        w_s0 = weights_res[:, 0, None, None, None]
+        w_s1 = weights_res[:, 1, None, None, None]
+        w_s2 = weights_res[:, 2, None, None, None]
+        l_new = l_new + w_s1 * dino_res_n + w_s2 * sam_res_n
+
+        # loss cân bằng router, tránh collapse về 1 expert
+        router_balancing_loss = 0.01 * (
+            ((weights_rec.mean(0) - 1/3)**2).sum() +
+            ((weights_res.mean(0) - 1/3)**2).sum()
+        )
 
         x_ = [s_new, m_new, l_new]
 
@@ -298,6 +342,7 @@ class Net(nn.Module):
 
         if self.training:
             loss_det = self.head(x_new, y_new)
+            loss_det = loss_det + router_balancing_loss
             predictions_s = self.head.getPrediction(x_new, y_new)
             predictions_list = [predictions_s]
             pred_boxes = self.get_boxes(boxes_sml_new, predictions_list, self.class_num)
