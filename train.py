@@ -59,11 +59,11 @@ def train_one_epoch(__C,
         # print(ref_txt)
         mask_iter = mask_iter.cuda(non_blocking=True)
         info_iter = info_iter.cuda(non_blocking=True)
-        # ref_iter = ref_iter.cuda(non_blocking=True)
-        ref_iter = {
-            k: v.cuda(non_blocking=True)
-            for k, v in ref_iter.items()
-        }
+        ref_iter = ref_iter.cuda(non_blocking=True)
+        # ref_iter = {
+        #     k: v.cuda(non_blocking=True)
+        #     for k, v in ref_iter.items()
+        # }
         image_iter = image_iter.cuda(non_blocking=True)
         box_iter = box_iter.cuda(non_blocking=True)
 
