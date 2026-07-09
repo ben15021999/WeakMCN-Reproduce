@@ -1,15 +1,17 @@
-from transformers import Dinov2Model
-import torch.nn.functional as F
-import math
-from utils.utils import clip_boxes_to_image
-from EfficientSAM.efficient_sam.build_efficient_sam import build_efficient_sam_vitt, build_efficient_sam_vits
-from models.weakmcn.seg_head import REShead
-from models.network_blocks import MultiScaleFusion, SimpleFusion, GaranAttention
-from models.weakmcn.head import WeakREChead
-from models.visual_encoder import visual_encoder
-from models.language_encoder import language_encoder
-import torch.nn as nn
+# coding=utf-8
 import torch
+import torch.nn as nn
+from models.language_encoder import language_encoder
+from models.visual_encoder import visual_encoder
+from models.weakmcn.head import WeakREChead
+from models.network_blocks import MultiScaleFusion, SimpleFusion, GaranAttention
+from models.weakmcn.seg_head import REShead
+from EfficientSAM.efficient_sam.build_efficient_sam import build_efficient_sam_vitt, build_efficient_sam_vits
+from utils.utils import clip_boxes_to_image
+import math
+import torch.nn.functional as F
+from transformers import Dinov2Model
+
 
 class PositionEmbeddingSine(nn.Module):
     """
@@ -60,11 +62,7 @@ class Net(nn.Module):
         self.num_points = __C.NUM_POINTS
 
         self.linear_vs = nn.Linear(__C.WREC_DIM, __C.HIDDEN_SIZE)
-        # self.linear_ts = nn.Linear(512, __C.HIDDEN_SIZE)
-        self.linear_ts = nn.Linear(
-            __C.HIDDEN_SIZE,
-            __C.HIDDEN_SIZE
-        )
+        self.linear_ts = nn.Linear(512, __C.HIDDEN_SIZE)
         self.head = WeakREChead(__C)
         self.seg_head = REShead(__C.WRES_DIM,  __C.INPUT_SHAPE, __C.IOU_THRESH)
         self.multi_scale_manner = MultiScaleFusion(
@@ -83,12 +81,6 @@ class Net(nn.Module):
         )
         self.attention_manner = GaranAttention(512, __C.WRES_DIM)
 
-        self.res_proj = nn.Conv2d(
-            512,
-            __C.WRES_DIM,
-            kernel_size=2
-        )
-
         # load ESAM model
         if __C.USE_VITS:
             self.efficientsam = build_efficient_sam_vits()
@@ -102,8 +94,11 @@ class Net(nn.Module):
         self.linear_dino_rec = nn.Linear(768, __C.WREC_DIM)
         self.linear_dino_res = nn.Linear(768, __C.WREC_DIM)
 
-        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
-        self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
+        # self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
+        # self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
+
+        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 3)  # [keep, dino, sam]
+        self.linear_router_res = nn.Linear(__C.WRES_DIM, 3)
 
         self.class_num = __C.CLASS_NUM
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
@@ -198,11 +193,18 @@ class Net(nn.Module):
 
     def get_position_embedding(self, yolov3_output):
         # [64, 17, 2] bbox midpoints [batch, num_anchors, x_center, y_center]
-        bbox = yolov3_output[..., :2].mean(2)
-        # Normalize coordinates to [0, 1]
-        scaled_bbox = bbox / self.scale_factor_h
-        position_embeddings = self.pos_encoder(scaled_bbox)
-        return position_embeddings
+        # bbox = yolov3_output[..., :2].mean(2)
+        # # Normalize coordinates to [0, 1]
+        # scaled_bbox = bbox / self.scale_factor_h
+        # position_embeddings = self.pos_encoder(scaled_bbox)
+        # return position_embeddings
+        bbox = yolov3_output[..., :2].mean(2)  # [B, N, 2]
+        scaled_bbox = bbox.clone()
+        scaled_bbox[..., 0] = scaled_bbox[..., 0] / \
+            self.scale_factor_w  # x / W
+        scaled_bbox[..., 1] = scaled_bbox[..., 1] / \
+            self.scale_factor_h  # y / H
+        return self.pos_encoder(scaled_bbox)
 
     def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None):
         # Vision and Language Encodingå
@@ -256,18 +258,18 @@ class Net(nn.Module):
         # Calculate the probability distribution of router_logits
         router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
         router_logits = torch.softmax(router_logits, dim=-1)
-        s_new = s_new + dino_feature_rec * \
-            router_logits[:, 0][:, None, None, None] + \
-            sam_feature_rec * router_logits[:, 1][:, None, None, None]
-        # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
+        # s_new = s_new + dino_feature_rec * \
+        #     router_logits[:, 0][:, None, None, None] + \
+        #     sam_feature_rec * router_logits[:, 1][:, None, None, None]
+        s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
 
         # Calculate the probability distribution of router_logits
         router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
         router_logits = torch.softmax(router_logits, dim=-1)
-        l_new = l_new + dino_feature_res * \
-            router_logits[:, 0][:, None, None, None] + \
-            sam_feature_res * router_logits[:, 1][:, None, None, None]
-        # l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
+        # l_new = l_new + dino_feature_res * \
+        #     router_logits[:, 0][:, None, None, None] + \
+        #     sam_feature_res * router_logits[:, 1][:, None, None, None]
+        l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
 
         x_ = [s_new, m_new, l_new]
         # Anchor Selection
@@ -283,7 +285,6 @@ class Net(nn.Module):
                 3).expand(bs, gridnum, anncornum, ch)).contiguous().view(bs, selnum, anncornum, ch)
         boxes_sml_new.append(box_sml_new)
 
-        # chỗ này gắn cái SAM2 vô để refine lại cái bbox
         batchsize, dim, h, w = x_[0].size()
         i_new = x_[0].view(batchsize, dim, h * w).permute(0, 2, 1)
         bs, gridnum, ch = i_new.shape
@@ -297,12 +298,12 @@ class Net(nn.Module):
         x_new = x_new + position_embedding
         y_new = self.linear_ts(y_['flat_lang_feat'].unsqueeze(1))
 
+        # sim = torch.einsum('bnd,bd->bn', F.normalize(x_new, -1),
+        #                    F.normalize(y_new.squeeze(1), -1))
+        # top2 = sim.topk(2, dim=1).values
+        # margin_loss = F.relu(0.2 - (top2[:, 0] - top2[:, 1])).mean()
+
         x_sup = [l_new, m_new, s_new]
-        # x_sup = [
-        #     self.res_proj(l_new),
-        #     self.res_proj(m_new),
-        #     self.res_proj(s_new)
-        # ]
         for i in range(len(self.fusion_manner)):
             x_sup[i] = self.fusion_manner[i](x_sup[i], y_['flat_lang_feat'])
         x_sup = self.multi_scale_manner_sup(x_sup)
