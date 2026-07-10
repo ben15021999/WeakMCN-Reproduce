@@ -94,11 +94,11 @@ class Net(nn.Module):
         self.linear_dino_rec = nn.Linear(768, __C.WREC_DIM)
         self.linear_dino_res = nn.Linear(768, __C.WREC_DIM)
 
-        # self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
-        # self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
+        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
+        self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
 
-        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 3)  # [keep, dino, sam]
-        self.linear_router_res = nn.Linear(__C.WRES_DIM, 3)
+        # self.linear_router_rec = nn.Linear(__C.WREC_DIM, 3)  # [keep, dino, sam]
+        # self.linear_router_res = nn.Linear(__C.WRES_DIM, 3)
 
         self.class_num = __C.CLASS_NUM
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
@@ -258,18 +258,18 @@ class Net(nn.Module):
         # Calculate the probability distribution of router_logits
         router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
         router_logits = torch.softmax(router_logits, dim=-1)
-        # s_new = s_new + dino_feature_rec * \
-        #     router_logits[:, 0][:, None, None, None] + \
-        #     sam_feature_rec * router_logits[:, 1][:, None, None, None]
-        s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
+        s_new = s_new + dino_feature_rec * \
+            router_logits[:, 0][:, None, None, None] + \
+            sam_feature_rec * router_logits[:, 1][:, None, None, None]
+        # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
 
         # Calculate the probability distribution of router_logits
         router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
         router_logits = torch.softmax(router_logits, dim=-1)
-        # l_new = l_new + dino_feature_res * \
-        #     router_logits[:, 0][:, None, None, None] + \
-        #     sam_feature_res * router_logits[:, 1][:, None, None, None]
-        l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
+        l_new = l_new + dino_feature_res * \
+            router_logits[:, 0][:, None, None, None] + \
+            sam_feature_res * router_logits[:, 1][:, None, None, None]
+        # l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
 
         x_ = [s_new, m_new, l_new]
         # Anchor Selection
