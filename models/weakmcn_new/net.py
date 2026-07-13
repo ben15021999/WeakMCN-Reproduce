@@ -298,11 +298,6 @@ class Net(nn.Module):
         x_new = x_new + position_embedding
         y_new = self.linear_ts(y_['flat_lang_feat'].unsqueeze(1))
 
-        # sim = torch.einsum('bnd,bd->bn', F.normalize(x_new, -1),
-        #                    F.normalize(y_new.squeeze(1), -1))
-        # top2 = sim.topk(2, dim=1).values
-        # margin_loss = F.relu(0.2 - (top2[:, 0] - top2[:, 1])).mean()
-
         x_sup = [l_new, m_new, s_new]
         for i in range(len(self.fusion_manner)):
             x_sup[i] = self.fusion_manner[i](x_sup[i], y_['flat_lang_feat'])
