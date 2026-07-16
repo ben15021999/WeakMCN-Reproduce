@@ -42,21 +42,20 @@ class WeakREChead(nn.Module):
 
         # --- chỉ thêm đoạn này ---
         # ép top1 và top2 trong cùng ảnh phải cách nhau một khoảng
-        pos_sim = sim_map[torch.arange(batchsize), torch.arange(batchsize), 0]  # [B, K]
+        # pos_sim = sim_map[torch.arange(batchsize), torch.arange(batchsize), 0]  # [B, K]
 
-
-        # pos_sim = sim_map[torch.arange(batchsize), torch.arange(
-        #     batchsize)].mean(dim=1)  # [B, V]
-        # top2 = pos_sim.topk(2, dim=1).values  # [B, 2]
-        # margin_loss = F.relu(1.0 - (top2[:, 0] - top2[:, 1])).mean()
+        pos_sim = sim_map[torch.arange(batchsize), torch.arange(
+            batchsize)].mean(dim=1)  # [B, V]
+        top2 = pos_sim.topk(2, dim=1).values  # [B, 2]
+        margin_loss = F.relu(0.2 - (top2[:, 0] - top2[:, 1])).mean()
         # Top-1 proposal
-        top1, top1_idx = pos_sim.max(dim=1)
+        # top1, top1_idx = pos_sim.max(dim=1)
 
-        # Mean similarity của các proposal còn lại
-        mask = torch.ones_like(pos_sim, dtype=torch.bool)
-        mask.scatter_(1, top1_idx.unsqueeze(1), False)
+        # # Mean similarity của các proposal còn lại
+        # mask = torch.ones_like(pos_sim, dtype=torch.bool)
+        # mask.scatter_(1, top1_idx.unsqueeze(1), False)
 
-        other_mean = pos_sim.masked_select(mask).view(batchsize, -1).mean(dim=1)
-        margin_loss = F.relu(0.2 - (top1 - other_mean)).mean()
+        # other_mean = pos_sim.masked_select(mask).view(batchsize, -1).mean(dim=1)
+        # margin_loss = F.relu(0.2 - (top1 - other_mean)).mean()
 
         return loss + 0.1 * margin_loss
