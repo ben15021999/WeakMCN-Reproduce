@@ -97,8 +97,13 @@ class Net(nn.Module):
         self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
         self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
 
-        # self.linear_router_rec = nn.Linear(__C.WREC_DIM, 3)  # [keep, dino, sam]
-        # self.linear_router_res = nn.Linear(__C.WRES_DIM, 3)
+        self.rec_gate = nn.Sequential(
+            nn.Linear(__C.WREC_DIM * 3, __C.WREC_DIM),
+            nn.ReLU(),
+            # 3 cổng cho: Base feature, DINOv2, SAM
+            nn.Linear(__C.WREC_DIM, 3),
+            nn.Softmax(dim=-1)
+        )
 
         self.class_num = __C.CLASS_NUM
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
@@ -256,12 +261,27 @@ class Net(nn.Module):
             52, 52), mode='bilinear', align_corners=False)
 
         # Calculate the probability distribution of router_logits
-        router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
-        router_logits = torch.softmax(router_logits, dim=-1)
-        s_new = s_new + dino_feature_rec * \
-            router_logits[:, 0][:, None, None, None] + \
-            sam_feature_rec * router_logits[:, 1][:, None, None, None]
+        # router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
+        # router_logits = torch.softmax(router_logits, dim=-1)
+        # s_new = s_new + dino_feature_rec * \
+        #     router_logits[:, 0][:, None, None, None] + \
+        #     sam_feature_rec * router_logits[:, 1][:, None, None, None]
         # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
+        # Pool toàn cục 3 nguồn đặc trưng về dạng vector 1D [B, C] để đưa vào Gate quyết định
+        base_rec_pool = F.adaptive_avg_pool2d(s_new, (1, 1)).flatten(1)           # [B, C]
+        dino_rec_pool = F.adaptive_avg_pool2d(dino_feature_rec, (1, 1)).flatten(1)  # [B, C]
+        sam_rec_pool = F.adaptive_avg_pool2d(sam_feature_rec, (1, 1)).flatten(1)   # [B, C]
+
+        # Nối (Concatenate) thông tin của cả 3 nguồn để Gate có cái nhìn toàn cảnh
+        # KHÔNG DÙNG .detach() để các đặc trưng bổ trợ tự cập nhật gradient ngược lại backbone
+        gate_rec_input = torch.cat([base_rec_pool, dino_rec_pool, sam_rec_pool], dim=-1)  # [B, C*3]
+        rec_gates = self.rec_gate(gate_rec_input)  # [B, 3]
+
+        # Áp dụng trọng số cổng (Gate weights) mềm dẻo cho từng nguồn đặc trưng tương ứng
+        s_new = (s_new * rec_gates[:, 0][:, None, None, None] +
+                 dino_feature_rec * rec_gates[:, 1][:, None, None, None] +
+                 sam_feature_rec * rec_gates[:, 2][:, None, None, None])
+
 
         # Calculate the probability distribution of router_logits
         router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
