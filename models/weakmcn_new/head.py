@@ -1,7 +1,6 @@
 # coding=utf-8
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class WeakREChead(nn.Module):
@@ -29,7 +28,7 @@ class WeakREChead(nn.Module):
         max_sims, _ = sim_map.topk(k=2, dim=-1, largest=True, sorted=True)
         max_sims = max_sims.squeeze(2)
 
-        # Negative Anchor Augmentation - giữ nguyên gốc
+        # Negative Anchor Augmentation
         max_sim_0, max_sim_1 = max_sims[..., 0], max_sims[..., 1]
         max_sim_1 = max_sim_1.masked_select(~torch.eye(batchsize).bool().to(max_sim_1.device)).contiguous().view(
             batchsize,
@@ -39,23 +38,4 @@ class WeakREChead(nn.Module):
         target = torch.eye(batchsize).to(vis_emb.device)
         target_pred = torch.argmax(target, dim=1)
         loss = nn.CrossEntropyLoss(reduction="mean")(new_logits, target_pred)
-
-        # --- chỉ thêm đoạn này ---
-        # ép top1 và top2 trong cùng ảnh phải cách nhau một khoảng
-        # pos_sim = sim_map[torch.arange(batchsize), torch.arange(batchsize), 0]  # [B, K]
-
-        pos_sim = sim_map[torch.arange(batchsize), torch.arange(
-            batchsize)].mean(dim=1)  # [B, V]
-        top2 = pos_sim.topk(2, dim=1).values  # [B, 2]
-        margin_loss = F.relu(0.2 - (top2[:, 0] - top2[:, 1])).mean()
-        # Top-1 proposal
-        # top1, top1_idx = pos_sim.max(dim=1)
-
-        # # Mean similarity của các proposal còn lại
-        # mask = torch.ones_like(pos_sim, dtype=torch.bool)
-        # mask.scatter_(1, top1_idx.unsqueeze(1), False)
-
-        # other_mean = pos_sim.masked_select(mask).view(batchsize, -1).mean(dim=1)
-        # margin_loss = F.relu(0.2 - (top1 - other_mean)).mean()
-
-        return loss + 0.1 * margin_loss
+        return loss
