@@ -13,7 +13,10 @@ import torch.optim as Optim
 from importlib import import_module
 import cv2
 import numpy as np
+import torch
 
+from PIL import Image, ImageFilter
+from transformers import CLIPProcessor, CLIPModel
 
 class ModelLoader:
     def __init__(self, __C):
@@ -65,6 +68,62 @@ def truncate_bounding_boxes(boxes, image_width, image_height):
     return boxes
 
 
+def make_isolated(pil_img, box_xyxy):
+    x1, y1, x2, y2 = map(int, box_xyxy)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(pil_img.size[0], x2), min(pil_img.size[1], y2)
+    blurred = pil_img.filter(ImageFilter.GaussianBlur(radius=15))
+    isolated = blurred.copy()
+    isolated.paste(pil_img.crop((x1, y1, x2, y2)), (x1, y1))
+    return isolated
+
+
+# load 1 lần ở đầu file validate
+hf_id = "openai/clip-vit-large-patch14"
+clip_model = CLIPModel.from_pretrained(hf_id).cuda().eval()
+clip_processor = CLIPProcessor.from_pretrained(hf_id)
+
+@torch.no_grad()
+def clip_rerank_one(pil_img, boxes_xyxy, weak_scores, expression):
+    # boxes_xyxy: [K,4] đã là tọa độ gốc, weak_scores: [K]
+    isolated = [make_isolated(pil_img, b) for b in boxes_xyxy]
+    # encode riêng, đừng gộp chung
+    image_inputs = clip_processor(
+        images=isolated, return_tensors="pt").to("cuda")
+    text_inputs = clip_processor(
+        text=[f"a photo of {expression}"], return_tensors="pt", padding=True).to("cuda")
+
+    img_out = clip_model.get_image_features(**image_inputs)
+    txt_out = clip_model.get_text_features(**text_inputs)
+
+    # fix cho bản transformers mới: lấy tensor bên trong object
+    if isinstance(img_out, torch.Tensor):
+        img_f = img_out
+    else:
+        # bản mới trả về object, lấy pooler_output hoặc image_embeds
+        img_f = getattr(img_out, 'pooler_output', None) or getattr(
+            img_out, 'image_embeds', None) or img_out[0]
+
+    if isinstance(txt_out, torch.Tensor):
+        txt_f = txt_out
+    else:
+        txt_f = getattr(txt_out, 'pooler_output', None) or getattr(
+            txt_out, 'text_embeds', None) or getattr(txt_out, 'image_embeds', None) or txt_out[0]
+
+    img_f = img_f / img_f.norm(dim=-1, keepdim=True)
+    txt_f = txt_f / txt_f.norm(dim=-1, keepdim=True)
+
+    # txt_f là [1, 512], img_f là [K, 512]
+    clip_scores = (img_f @ txt_f.T).squeeze(1).cpu().numpy()
+
+    weak = (weak_scores - weak_scores.min()) / \
+        (weak_scores.max() - weak_scores.min() + 1e-6)
+    clip = (clip_scores - clip_scores.min()) / \
+        (clip_scores.max() - clip_scores.min() + 1e-6)
+    final = 0.5 * weak + 0.5 * clip
+    return final.argmax()
+
+
 def validate_box_and_mask(__C,
                           net,
                           loader,
@@ -106,9 +165,30 @@ def validate_box_and_mask(__C,
             image_iter = image_iter.cuda(non_blocking=True)
             box_iter = box_iter.cuda(non_blocking=True)
             gt_box_iter = gt_box_iter.cuda(non_blocking=True)
-            box, mask = net(image_iter, ref_iter, box_gt=box_iter,
-                            mask_gt=mask_iter, info_iter=info_iter)
 
+
+            # box, mask = net(image_iter, ref_iter, box_gt=box_iter, mask_gt=mask_iter, info_iter=info_iter)
+            # mới
+            # [B, K, 5]
+            topk_boxes, mask = net(image_iter, ref_iter, box_gt=box_iter, mask_gt=mask_iter, info_iter=info_iter)
+            topk_boxes = topk_boxes.cpu().numpy()  # [B, K, 5] đang ở scale 416
+
+            # topk_boxes đang ở scale input, phải convert về ảnh gốc bằng yolobox2label cho từng K
+            final_boxes = []
+            for b in range(len(gt_box_iter)):
+                # load ảnh gốc để cho CLIP nhìn, dùng img_path có sẵn trong loader của bạn
+                pil_img = Image.open(img_path[b]).convert("RGB") if isinstance(img_path[b], str) else Image.fromarray(
+                    normed2original(image_iter[b], __C.MEAN, __C.STD).astype(np.uint8))
+
+                boxes_k_input = topk_boxes[b][:, :4]  # K,4
+                weak_k = topk_boxes[b][:, 4]
+                # convert K box sang tọa độ gốc để vừa tính IoU vừa cho CLIP
+                boxes_k_orig = np.array([yolobox2label(bb, info_iter[b])
+                                        for bb in boxes_k_input])
+
+                best_idx = clip_rerank_one(pil_img, boxes_k_orig, weak_k, ref_txt[b])
+                final_boxes.append(boxes_k_orig[best_idx])
+            box = np.array(final_boxes)  # [B, 4] đây là box sau rerank
             # timelist = []
             # for i in range(100):
             #     t1 = time.time()

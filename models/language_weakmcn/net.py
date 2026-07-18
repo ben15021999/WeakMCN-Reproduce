@@ -1,4 +1,5 @@
 # coding=utf-8
+from utils.utils import  clip_boxes_to_image
 import torch
 import torch.nn as nn
 from models.language_encoder import language_encoder
@@ -11,6 +12,47 @@ from utils.utils import clip_boxes_to_image
 import math
 import torch.nn.functional as F
 from transformers import Dinov2Model
+
+
+class PositionEmbeddingSine(nn.Module):
+    """
+    This is a more standard version of the position embedding, very similar to the one
+    used by the Attention is all you need paper, generalized to work on images.
+    """
+
+    def __init__(self, num_pos_feats=256, temperature=10000, normalize=True, scale=None):
+        super().__init__()
+        self.num_pos_feats = num_pos_feats
+        self.temperature = temperature
+        self.normalize = normalize
+        if scale is not None and normalize is False:
+            raise ValueError("normalize should be True if scale is passed")
+        if scale is None:
+            scale = 2 * math.pi
+        self.scale = scale
+
+    def forward(self, positions):
+        y_embed = positions[:, :, 1:] * self.scale
+        x_embed = positions[:, :, :1] * self.scale
+
+        dim_t = torch.arange(self.num_pos_feats,
+                             dtype=torch.float32, device=positions.device)
+        dim_t = self.temperature ** (2 * torch.div(dim_t,
+                                     2, rounding_mode='floor') / self.num_pos_feats)
+
+        # dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
+
+        pos_x = x_embed[:, :, :] / dim_t
+        pos_y = y_embed[:, :, :] / dim_t
+        pos_x = torch.stack(
+            (pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)
+        pos_y = torch.stack(
+            (pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3).flatten(2)
+        pos = torch.cat((pos_y, pos_x), dim=2)
+        return pos
+
+
+# coding=utf-8
 
 
 class PositionEmbeddingSine(nn.Module):
@@ -190,16 +232,11 @@ class Net(nn.Module):
 
     def get_position_embedding(self, yolov3_output):
         # [64, 17, 2] bbox midpoints [batch, num_anchors, x_center, y_center]
-        # bbox = yolov3_output[..., :2].mean(2)
-        # # Normalize coordinates to [0, 1]
-        # scaled_bbox = bbox / self.scale_factor_h
-        # position_embeddings = self.pos_encoder(scaled_bbox)
-        # return position_embeddings
-        bbox = yolov3_output[..., :2].mean(2)  # [B, N, 2]
-        scaled_bbox = bbox.clone()
-        scaled_bbox[..., 0] = scaled_bbox[..., 0] / self.scale_factor_w  # x / W
-        scaled_bbox[..., 1] = scaled_bbox[..., 1] / self.scale_factor_h  # y / H
-        return self.pos_encoder(scaled_bbox)
+        bbox = yolov3_output[..., :2].mean(2)
+        # Normalize coordinates to [0, 1]
+        scaled_bbox = bbox / self.scale_factor_h
+        position_embeddings = self.pos_encoder(scaled_bbox)
+        return position_embeddings
 
     def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None):
         # Vision and Language Encodingå
@@ -294,11 +331,6 @@ class Net(nn.Module):
         x_new = x_new + position_embedding
         y_new = self.linear_ts(y_['flat_lang_feat'].unsqueeze(1))
 
-        sim = torch.einsum('bnd,bd->bn', F.normalize(x_new, -1),
-                           F.normalize(y_new.squeeze(1), -1))
-        top2 = sim.topk(2, dim=1).values
-        margin_loss = F.relu(0.2 - (top2[:, 0] - top2[:, 1])).mean()
-
         x_sup = [l_new, m_new, s_new]
         for i in range(len(self.fusion_manner)):
             x_sup[i] = self.fusion_manner[i](x_sup[i], y_['flat_lang_feat'])
@@ -320,15 +352,13 @@ class Net(nn.Module):
             predict_masks = self.ensure_float32(predict_masks)
             loss_seg = self.seg_head(
                 seg_emb, box_gt, predict_masks, pred_boxes, epoch)
-            return loss_det + margin_loss, loss_seg
+            return loss_det, loss_seg
         else:
             predictions_s = self.head(x_new, y_new)
             predictions_list = [predictions_s]
             topk_boxes = self.get_topk_boxes(boxes_sml_new, predictions_list, self.class_num)
-            # box_pred = self.get_boxes(
-            #     boxes_sml_new, predictions_list, self.class_num)
             _, mask_pred = self.seg_head(seg_emb)
-            return topk_boxes, mask_pred
+            return box_pred, mask_pred
         
     def get_topk_boxes(self, boxes_sml, predictionslist, class_num, k=10):
         batchsize = predictionslist[0].size()[0]
@@ -340,8 +370,10 @@ class Net(nn.Module):
                 refined_pred[:, :, 2] / 2
             refined_pred[:, :, 1] = refined_pred[:, :, 1] - \
                 refined_pred[:, :, 3] / 2
-            refined_pred[:, :, 2] = refined_pred[:, :, 0] + refined_pred[:, :, 2]
-            refined_pred[:, :, 3] = refined_pred[:, :, 1] + refined_pred[:, :, 3]
+            refined_pred[:, :, 2] = refined_pred[:, :, 0] + \
+                refined_pred[:, :, 2]
+            refined_pred[:, :, 3] = refined_pred[:, :, 1] + \
+                refined_pred[:, :, 3]
             pred.append(refined_pred.data)
         boxes = torch.cat(pred, 1)  # [B, N, 5] x1,y1,x2,y2,score
         k = min(k, boxes.shape[1])
