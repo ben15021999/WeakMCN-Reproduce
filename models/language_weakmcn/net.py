@@ -324,10 +324,32 @@ class Net(nn.Module):
         else:
             predictions_s = self.head(x_new, y_new)
             predictions_list = [predictions_s]
-            box_pred = self.get_boxes(
-                boxes_sml_new, predictions_list, self.class_num)
+            topk_boxes = self.get_topk_boxes(boxes_sml_new, predictions_list, self.class_num)
+            # box_pred = self.get_boxes(
+            #     boxes_sml_new, predictions_list, self.class_num)
             _, mask_pred = self.seg_head(seg_emb)
-            return box_pred, mask_pred
+            return topk_boxes, mask_pred
+        
+    def get_topk_boxes(self, boxes_sml, predictionslist, class_num, k=10):
+        batchsize = predictionslist[0].size()[0]
+        pred = []
+        for i in range(len(predictionslist)):
+            masked_pred = boxes_sml[i]
+            refined_pred = masked_pred.view(batchsize, -1, class_num + 5)
+            refined_pred[:, :, 0] = refined_pred[:, :, 0] - \
+                refined_pred[:, :, 2] / 2
+            refined_pred[:, :, 1] = refined_pred[:, :, 1] - \
+                refined_pred[:, :, 3] / 2
+            refined_pred[:, :, 2] = refined_pred[:, :, 0] + refined_pred[:, :, 2]
+            refined_pred[:, :, 3] = refined_pred[:, :, 1] + refined_pred[:, :, 3]
+            pred.append(refined_pred.data)
+        boxes = torch.cat(pred, 1)  # [B, N, 5] x1,y1,x2,y2,score
+        k = min(k, boxes.shape[1])
+        scores = boxes[:, :, 4]
+        _, topk_idx = torch.topk(scores, k=k, dim=1)
+        topk_idx_exp = topk_idx.unsqueeze(-1).expand(-1, -1, 5)
+        topk_boxes = torch.gather(boxes, 1, topk_idx_exp)
+        return topk_boxes
 
     def ensure_float32(self, tensor):
         """

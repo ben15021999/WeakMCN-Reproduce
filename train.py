@@ -274,6 +274,7 @@ def main_worker(gpu, __C):
         if main_process(__C, gpu):
             print("==> loaded checkpoint from {}\n".format(__C.RESUME_PATH) +
                   "==> epoch: {} lr: {} ".format(checkpoint['epoch'], checkpoint['lr']))
+            optimizer.param_groups[0]["lr"] = checkpoint['lr']
 
     if __C.AMP:
         assert th.__version__ >= '1.6.0', \
