@@ -1,19 +1,19 @@
-import torch.nn as nn
-from utils.utils import EMA
-from test import validate_box_and_mask, validate
-import torch.optim as Optim
-from importlib import import_module
-from utils.utils import *
-from tensorboardX import SummaryWriter
-from datasets.dataloader import loader, RefCOCODataSet
-from utils import config
-import time
-import argparse
-from utils.logging import *
-from torch.nn.parallel import DistributedDataParallel as DDP
-from utils.ckpt import *
-import torch.multiprocessing as mp
 from utils.distributed import *
+import torch.multiprocessing as mp
+from utils.ckpt import *
+from torch.nn.parallel import DistributedDataParallel as DDP
+from utils.logging import *
+import argparse
+import time
+from utils import config
+from datasets.dataloader import loader, RefCOCODataSet
+from tensorboardX import SummaryWriter
+from utils.utils import *
+from importlib import import_module
+import torch.optim as Optim
+from test import validate_box_and_mask, validate
+from utils.utils import EMA
+import torch.nn as nn
 
 
 class ModelLoader:
@@ -192,13 +192,16 @@ def main_worker(gpu, __C):
                                 rank=__C.RANK)
     if (__C.TRAIN_LOADER_PATH):
         train_loader = torch.load(
-            __C.TRAIN_LOADER_PATH, map_location=lambda storage, loc: storage.cuda())
+            __C.TRAIN_LOADER_PATH, weights_only=False)
+        train_set = train_loader['train_set']
+        train_loader = train_loader['train_loader']
+        print(f'Loaded train_loader from {__C.TRAIN_LOADER_PATH}')
     else:
         train_set = RefCOCODataSet(__C, split='train')
         train_loader = loader(__C, train_set, gpu, shuffle=(
             not __C.MULTIPROCESSING_DISTRIBUTED), drop_last=True)
-        torch.save({'train_loader': train_loader},os.path.join(__C.LOG_PATH, __C.MODEL,
-                        'seed_{}'.format(__C.SEED), str(__C.VERSION), 'ckpt', 'train_loader.pth'))
+        torch.save({'train_loader': train_loader, 'train_set': train_set}, os.path.join(__C.LOG_PATH, __C.MODEL,
+                                                                                        'seed_{}'.format(__C.SEED), str(__C.VERSION), 'ckpt', 'train_loader.pth'))
 
     val_set = RefCOCODataSet(__C, split='val')
     val_loader = loader(__C, val_set, gpu, shuffle=False)

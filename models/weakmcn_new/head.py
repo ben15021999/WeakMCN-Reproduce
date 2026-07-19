@@ -7,9 +7,6 @@ import torch.nn.functional as F
 class WeakREChead(nn.Module):
     def __init__(self, __C):
         super(WeakREChead, self).__init__()
-        self.register_buffer('anchor_memory', torch.zeros(1))  # sẽ init lười
-        self.momentum = 0.9
-        self.temperature = 0.07  # Thêm temperature để chuẩn hóa biên độ logits
 
     def forward(self, vis_fs, lan_fs):
         if self.training:
@@ -45,13 +42,17 @@ class WeakREChead(nn.Module):
 
         # ép top1 và top2 trong cùng ảnh phải cách nhau một khoảng
         # pos_sim = sim_map[torch.arange(batchsize), torch.arange(batchsize), 0]  # [B, K]
-        pos_sim = sim_map[torch.arange(batchsize), torch.arange(batchsize)].mean(dim=1)  # [B, V]
-        if self.anchor_memory.numel() != pos_sim.numel() or self.anchor_memory.shape[0] != pos_sim.shape[0]:
-            self.anchor_memory = pos_sim.detach()
-        else:
-            self.anchor_memory = self.momentum * self.anchor_memory + \
-                (1 - self.momentum) * pos_sim.detach()
-        # top2 = pos_sim.topk(2, dim=1).values  # [B, 2]
-        top2 = self.anchor_memory.topk(2, dim=1).values  # [B, 2]
+        pos_sim = sim_map[torch.arange(batchsize), torch.arange(
+            batchsize)].mean(dim=1)  # [B, V]
+        # if self.anchor_memory is None or self.anchor_memory.numel() != pos_sim.numel() or self.anchor_memory.shape[0] != pos_sim.shape[0]:
+        #     # Đảm bảo đồng bộ thiết bị (device) giống pos_sim
+        #     print('No')
+        #     self.anchor_memory = pos_sim.detach()
+        # else:
+        #     print('Yes')
+        #     self.anchor_memory = self.momentum * self.anchor_memory + \
+        #         (1 - self.momentum) * pos_sim.detach()
+        top2 = pos_sim.topk(2, dim=1).values  # [B, 2]
+        # top2 = self.anchor_memory.topk(2, dim=1).values  # [B, 2]
         margin_loss = F.relu(0.2 - (top2[:, 0] - top2[:, 1])).mean()
         return loss + 0.1 * margin_loss
