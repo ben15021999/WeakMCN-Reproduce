@@ -314,8 +314,17 @@ def main_worker(gpu, __C):
                                                 ema=ema)
         best_det_acc_list.append(box_ap)
         if main_process(__C, gpu):
-            save_dict = {'epoch': ith_epoch + 1, 'state_dict': net.state_dict(), 'optimizer': optimizer.state_dict(),
-                         'scheduler': scheduler.state_dict(), 'lr': optimizer.param_groups[0]["lr"]}
+            save_dict = {
+                'epoch': ith_epoch + 1,
+                'state_dict': net.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'lr': optimizer.param_groups[0]["lr"],
+                'rng_state': torch.get_rng_state(),
+                'cuda_rng_state': torch.cuda.get_rng_state(),
+                'numpy_rng_state': np.random.get_state(),
+                'python_rng_state': random.getstate()
+            }
             if ema is not None:
                 ema.apply_shadow()
                 save_dict['ema_step'] = ema.step
