@@ -273,6 +273,10 @@ def main_worker(gpu, __C):
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
         start_epoch = checkpoint['epoch']
+        torch.set_rng_state(checkpoint['rng_state'])
+        torch.cuda.set_rng_state(checkpoint['cuda_rng_state'])
+        np.random.set_state(checkpoint['numpy_rng_state'])
+        random.setstate(checkpoint['python_rng_state'])
         if __C.USE_EMA:
             ema = EMA(net, 0.9997)
 
