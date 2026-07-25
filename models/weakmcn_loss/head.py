@@ -52,6 +52,6 @@ class WeakREChead(nn.Module):
         p = F.softmax(pos_sim / tau, dim=-1)  # [B, Q, V]
         # entropy thấp = tự tin, cao = phân vân
         entropy = -(p * (p.clamp_min(1e-6).log())).sum(dim=-1).mean()  # scalar
-
+        print(0.05 * entropy)
         return loss + 0.05 * entropy
         # return loss + 0.1 * margin_loss
