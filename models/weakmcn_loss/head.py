@@ -39,9 +39,19 @@ class WeakREChead(nn.Module):
         target_pred = torch.argmax(target, dim=1)
         loss = nn.CrossEntropyLoss(reduction="mean")(new_logits, target_pred)
 
-        # ép top1 và top2 trong cùng ảnh phải cách nhau một khoảng
-        pos_sim = sim_map[torch.arange(batchsize), torch.arange(batchsize)].mean(dim=1)  # [B, V]
-        top2 = pos_sim.topk(2, dim=1).values  # [B, 2]
-        margin_loss = F.relu(0.2 - (top2[:, 0] - top2[:, 1])).mean()
-        
-        return loss + 0.1 * margin_loss
+        # # ép top1 và top2 trong cùng ảnh phải cách nhau một khoảng
+        # pos_sim = sim_map[torch.arange(batchsize), torch.arange(batchsize)].mean(dim=1)  # [B, V]
+        # top2 = pos_sim.topk(2, dim=1).values  # [B, 2]
+        # margin_loss = F.relu(0.2 - (top2[:, 0] - top2[:, 1])).mean()
+
+        # --- ĐỔI SANG ENTROPY Ở ĐÂY ---
+        pos_sim = sim_map[torch.arange(batchsize), torch.arange(batchsize)]  # [B, Q, V]
+
+        # softmax trên K anchor, tau càng nhỏ càng ép chọn 1 anchor
+        tau = 0.1
+        p = F.softmax(pos_sim / tau, dim=-1)  # [B, Q, V]
+        # entropy thấp = tự tin, cao = phân vân
+        entropy = -(p * (p.clamp_min(1e-6).log())).sum(dim=-1).mean()  # scalar
+
+        return loss + 0.05 * entropy
+        # return loss + 0.1 * margin_loss
