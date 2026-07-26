@@ -14,6 +14,11 @@ import torch.optim as Optim
 from test import validate_box_and_mask, validate
 from utils.utils import EMA
 import torch.nn as nn
+import torch
+from numpy.core.multiarray import _reconstruct
+import numpy as np
+torch.serialization.add_safe_globals(
+    [_reconstruct, np.ndarray, np.dtype, np.dtypes.UInt32DType])
 
 
 class ModelLoader:
@@ -273,8 +278,31 @@ def main_worker(gpu, __C):
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
         start_epoch = checkpoint['epoch']
-        torch.set_rng_state(checkpoint['rng_state'])
-        torch.cuda.set_rng_state(checkpoint['cuda_rng_state'])
+        rng_state = checkpoint["rng_state"]
+        if isinstance(rng_state, torch.Tensor):
+            # Đưa về CPU và chuyển sang kiểu uint8 (ByteTensor)
+            rng_state = rng_state.cpu().to(torch.uint8)
+        elif isinstance(rng_state, (bytes, bytearray)):
+            # Nếu là chuỗi bytes nguyên bản, chuyển thành ByteTensor từ buffer
+            rng_state = torch.frombuffer(rng_state, dtype=torch.uint8)
+        else:
+            # Trường hợp là list hoặc iterable khác
+            rng_state = torch.tensor(list(rng_state), dtype=torch.uint8)
+
+        torch.set_rng_state(rng_state)
+        cuda_rng_state = checkpoint['cuda_rng_state']
+        if isinstance(cuda_rng_state, torch.Tensor):
+            # Đưa về CPU và chuyển sang kiểu uint8 (ByteTensor)
+            cuda_rng_state = cuda_rng_state.cpu().to(torch.uint8)
+        elif isinstance(cuda_rng_state, (bytes, bytearray)):
+            # Nếu là chuỗi bytes nguyên bản, chuyển thành ByteTensor từ buffer
+            cuda_rng_state = torch.frombuffer(
+                cuda_rng_state, dtype=torch.uint8)
+        else:
+            # Trường hợp là list hoặc iterable khác
+            cuda_rng_state = torch.tensor(
+                list(cuda_rng_state), dtype=torch.uint8)
+        torch.cuda.set_rng_state(cuda_rng_state)
         np.random.set_state(checkpoint['numpy_rng_state'])
         random.setstate(checkpoint['python_rng_state'])
         if __C.USE_EMA:

@@ -19,7 +19,8 @@ class WeakREChead(nn.Module):
     def getPrediction(self, vis_emb, lan_emb):
         sim_map = torch.einsum('bkd, byd -> byk', vis_emb, lan_emb)
         maxval, v = sim_map.max(dim=2, keepdim=True)
-        predictions = torch.zeros_like(sim_map).to(sim_map.device).scatter(2, v.expand(sim_map.shape), 1).bool()
+        predictions = torch.zeros_like(sim_map).to(
+            sim_map.device).scatter(2, v.expand(sim_map.shape), 1).bool()
         return predictions
 
     def getContrast(self, vis_emb, lan_emb):
@@ -45,13 +46,14 @@ class WeakREChead(nn.Module):
         # margin_loss = F.relu(0.2 - (top2[:, 0] - top2[:, 1])).mean()
 
         # --- ĐỔI SANG ENTROPY Ở ĐÂY ---
-        pos_sim = sim_map[torch.arange(batchsize), torch.arange(batchsize)]  # [B, Q, V]
+        pos_sim = sim_map[torch.arange(
+            batchsize), torch.arange(batchsize)]  # [B, Q, V]
 
         # softmax trên K anchor, tau càng nhỏ càng ép chọn 1 anchor
         tau = 0.1
         p = F.softmax(pos_sim / tau, dim=-1)  # [B, Q, V]
         # entropy thấp = tự tin, cao = phân vân
         entropy = -(p * (p.clamp_min(1e-6).log())).sum(dim=-1).mean()  # scalar
-        print(0.05 * entropy)
-        return loss + 0.05 * entropy
+        # print(0.05 * entropy)
+        return loss + 0.1 * entropy
         # return loss + 0.1 * margin_loss
