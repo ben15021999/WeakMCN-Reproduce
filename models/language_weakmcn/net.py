@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 from models.language_encoder import language_encoder
 from models.visual_encoder import visual_encoder
-from models.weakmcn.head import WeakREChead
+from models.language_weakmcn.head import WeakREChead
 from models.network_blocks import MultiScaleFusion, SimpleFusion, GaranAttention
-from models.weakmcn.seg_head import REShead
+from models.language_weakmcn.seg_head import REShead
 from EfficientSAM.efficient_sam.build_efficient_sam import build_efficient_sam_vitt, build_efficient_sam_vits
 from utils.utils import clip_boxes_to_image
 import math

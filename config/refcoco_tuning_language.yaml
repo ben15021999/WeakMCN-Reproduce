@@ -22,7 +22,7 @@ MODEL:
 
 TRAIN:
   GPU: [0]
-  BATCH_SIZE: 20 # total batch size on a single node if multiprocessing_distributed else batch size on one gpu
+  BATCH_SIZE: 25 # total batch size on a single node if multiprocessing_distributed else batch size on one gpu
   NUM_WORKER: 4 # same as BATCH_SIZE
   LR: 0.0001
   EPOCHS: 25
@@ -44,6 +44,7 @@ TRAIN:
   AMP: False
   USING_CHECKPOINT: False
   SEED: 123456
+  TRAIN_LOADER_PATH: ''
 #  SEED: 234567
 #  SEED: 345678
 #  SEED: 456789
