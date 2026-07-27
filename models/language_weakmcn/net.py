@@ -1,5 +1,4 @@
 # coding=utf-8
-from utils.utils import  clip_boxes_to_image
 import torch
 import torch.nn as nn
 from models.language_encoder import language_encoder
@@ -13,7 +12,6 @@ import math
 import torch.nn.functional as F
 from transformers import Dinov2Model
 
-
 class PositionEmbeddingSine(nn.Module):
     """
     This is a more standard version of the position embedding, very similar to the one
@@ -50,48 +48,6 @@ class PositionEmbeddingSine(nn.Module):
             (pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3).flatten(2)
         pos = torch.cat((pos_y, pos_x), dim=2)
         return pos
-
-
-# coding=utf-8
-
-
-class PositionEmbeddingSine(nn.Module):
-    """
-    This is a more standard version of the position embedding, very similar to the one
-    used by the Attention is all you need paper, generalized to work on images.
-    """
-
-    def __init__(self, num_pos_feats=256, temperature=10000, normalize=True, scale=None):
-        super().__init__()
-        self.num_pos_feats = num_pos_feats
-        self.temperature = temperature
-        self.normalize = normalize
-        if scale is not None and normalize is False:
-            raise ValueError("normalize should be True if scale is passed")
-        if scale is None:
-            scale = 2 * math.pi
-        self.scale = scale
-
-    def forward(self, positions):
-        y_embed = positions[:, :, 1:] * self.scale
-        x_embed = positions[:, :, :1] * self.scale
-
-        dim_t = torch.arange(self.num_pos_feats,
-                             dtype=torch.float32, device=positions.device)
-        dim_t = self.temperature ** (2 * torch.div(dim_t,
-                                     2, rounding_mode='floor') / self.num_pos_feats)
-
-        # dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
-
-        pos_x = x_embed[:, :, :] / dim_t
-        pos_y = y_embed[:, :, :] / dim_t
-        pos_x = torch.stack(
-            (pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)
-        pos_y = torch.stack(
-            (pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3).flatten(2)
-        pos = torch.cat((pos_y, pos_x), dim=2)
-        return pos
-
 
 class Net(nn.Module):
     def __init__(self, __C, pretrained_emb, token_size):
@@ -356,32 +312,10 @@ class Net(nn.Module):
         else:
             predictions_s = self.head(x_new, y_new)
             predictions_list = [predictions_s]
-            topk_boxes = self.get_topk_boxes(boxes_sml_new, predictions_list, self.class_num)
+            box_pred = self.get_boxes(
+                boxes_sml_new, predictions_list, self.class_num)
             _, mask_pred = self.seg_head(seg_emb)
             return box_pred, mask_pred
-        
-    def get_topk_boxes(self, boxes_sml, predictionslist, class_num, k=10):
-        batchsize = predictionslist[0].size()[0]
-        pred = []
-        for i in range(len(predictionslist)):
-            masked_pred = boxes_sml[i]
-            refined_pred = masked_pred.view(batchsize, -1, class_num + 5)
-            refined_pred[:, :, 0] = refined_pred[:, :, 0] - \
-                refined_pred[:, :, 2] / 2
-            refined_pred[:, :, 1] = refined_pred[:, :, 1] - \
-                refined_pred[:, :, 3] / 2
-            refined_pred[:, :, 2] = refined_pred[:, :, 0] + \
-                refined_pred[:, :, 2]
-            refined_pred[:, :, 3] = refined_pred[:, :, 1] + \
-                refined_pred[:, :, 3]
-            pred.append(refined_pred.data)
-        boxes = torch.cat(pred, 1)  # [B, N, 5] x1,y1,x2,y2,score
-        k = min(k, boxes.shape[1])
-        scores = boxes[:, :, 4]
-        _, topk_idx = torch.topk(scores, k=k, dim=1)
-        topk_idx_exp = topk_idx.unsqueeze(-1).expand(-1, -1, 5)
-        topk_boxes = torch.gather(boxes, 1, topk_idx_exp)
-        return topk_boxes
 
     def ensure_float32(self, tensor):
         """
