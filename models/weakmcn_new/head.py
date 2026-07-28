@@ -1,8 +1,6 @@
 # coding=utf-8
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 
 class WeakREChead(nn.Module):
     def __init__(self, __C):
@@ -40,19 +38,4 @@ class WeakREChead(nn.Module):
         target_pred = torch.argmax(target, dim=1)
         loss = nn.CrossEntropyLoss(reduction="mean")(new_logits, target_pred)
 
-        # ép top1 và top2 trong cùng ảnh phải cách nhau một khoảng
-        # pos_sim = sim_map[torch.arange(batchsize), torch.arange(batchsize), 0]  # [B, K]
-        pos_sim = sim_map[torch.arange(batchsize), torch.arange(
-            batchsize)].mean(dim=1)  # [B, V]
-        # if self.anchor_memory is None or self.anchor_memory.numel() != pos_sim.numel() or self.anchor_memory.shape[0] != pos_sim.shape[0]:
-        #     # Đảm bảo đồng bộ thiết bị (device) giống pos_sim
-        #     print('No')
-        #     self.anchor_memory = pos_sim.detach()
-        # else:
-        #     print('Yes')
-        #     self.anchor_memory = self.momentum * self.anchor_memory + \
-        #         (1 - self.momentum) * pos_sim.detach()
-        top2 = pos_sim.topk(2, dim=1).values  # [B, 2]
-        # top2 = self.anchor_memory.topk(2, dim=1).values  # [B, 2]
-        margin_loss = F.relu(0.2 - (top2[:, 0] - top2[:, 1])).mean()
-        return loss + 0.1 * margin_loss
+        return loss
