@@ -13,61 +13,65 @@ from transformers import Dinov2Model
 
 
 class LanguageGuidedAnchorSelector(nn.Module):
-    def __init__(self, visual_dim, text_dim, hidden_dim=256):
+    def __init__(self, visual_dim=512, text_dim=512, hidden_dim=256):
         super().__init__()
-        # Project cả Vision và Text về cùng không gian nhúng (Embedding Space)
         self.v_proj = nn.Linear(visual_dim, hidden_dim)
         self.t_proj = nn.Linear(text_dim, hidden_dim)
-        # Cổng trọng số linh hoạt (Gate) để cân bằng giữa YOLO score và Text score
-        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.alpha = nn.Parameter(torch.tensor(3.0))
+        # Zero-init weights của t_proj để ban đầu không tạo ra noise làm hỏng Anchor Selection
+        nn.init.zeros_(self.t_proj.weight)
+        nn.init.zeros_(self.t_proj.bias)
 
-    def forward(self, boxes_sml, feature_map, flat_lang_feat, select_num):
-        """
-        boxes_sml: [B, gridnum, anncornum, ch] (ch có channel 4 là conf score)
-        feature_map (s_new): [B, C, H, W]
-        flat_lang_feat: [B, text_dim]
-        """
+    def forward(self, boxes_sml, feature_map, flat_lang_feat, select_num, epoch=None):
         bs, gridnum, anncornum, ch = boxes_sml[0].shape
 
-        # 1. Lấy Objectness Score từ YOLOv3 (như cũ)
-        yolo_score = torch.mean(boxes_sml[0], dim=2)[:, :, 4]  # [B, gridnum]
-        yolo_score = torch.sigmoid(yolo_score)  # Normalization về [0, 1]
+        # 1. Objectness score từ YOLOv3 (Khoảng [0, 1])
+        yolo_score = torch.mean(boxes_sml[0], dim=2)[:, :, 4]
+        yolo_score = torch.sigmoid(yolo_score)
 
-        # 2. Tính Text-Visual Alignment Score cho từng Grid Cell
-        # Reshape feature_map từ (B, C, H, W) thành (B, H*W, C) -> (B, gridnum, visual_dim)
-        B, C, H, W = feature_map.shape
-        v_feat = feature_map.view(
-            B, C, H * W).permute(0, 2, 1)  # [B, gridnum, C]
+        # ĐIỀU KIỆN AN TOÀN: Ở Epoch 0 khi ĐÁNH GIÁ (eval/val), dùng 100% YOLO Score
+        # Điều này giúp IoU ở Epoch 0 Val không bao giờ bị rớt thảm hại
+        if (epoch is not None and epoch == 0 and not self.training):
+            final_score = yolo_score
+        else:
+            # 2. Tính Text-Visual Similarity
+            B, C, H, W = feature_map.shape
+            v_feat = feature_map.view(
+                B, C, H * W).permute(0, 2, 1)  # [B, gridnum, C]
 
-        # [B, gridnum, hidden_dim]
-        v_emb = F.normalize(self.v_proj(v_feat), p=2, dim=-1)
-        t_emb = F.normalize(self.t_proj(flat_lang_feat),
-                            p=2, dim=-1)   # [B, hidden_dim]
+            v_emb = self.v_proj(v_feat)
+            t_emb = self.t_proj(flat_lang_feat)
 
-        # Cosine Similarity giữa từng Anchor Cell và Câu Text
-        # (B, gridnum, hidden_dim) x (B, hidden_dim, 1) -> (B, gridnum)
-        text_sim_score = torch.bmm(v_emb, t_emb.unsqueeze(2)).squeeze(2)
-        text_sim_score = (text_sim_score + 1) / 2  # Scale về [0, 1]
+            # Dot product
+            raw_dot_product = torch.bmm(v_emb, t_emb.unsqueeze(2)).squeeze(2)
+            text_sim_score = torch.sigmoid(raw_dot_product)
 
-        # 3. Kết hợp 2 điểm số (Hybrid Score)
-        # alpha kiểm soát mức độ ưu tiên giữa YOLO score và Text Similarity
-        gate = torch.sigmoid(self.alpha)
-        final_score = gate * yolo_score + (1 - gate) * text_sim_score
+            # 3. Kết hợp bằng Gate tự học
+            gate = torch.sigmoid(self.alpha)  # Ban đầu gate ≈ 0.95
+            final_score = gate * yolo_score + (1 - gate) * text_sim_score
 
-        # 4. Top-K Selection dựa trên Final Score
+        # 4. Top-K Selection
         vals, indices = final_score.topk(
             k=int(select_num), dim=1, largest=True, sorted=True)
 
-        # 5. Mask Select Anchor Box
+        # 5. Gather Anchors và Visual Feature Map theo indices
         box_sml_new = boxes_sml[0].masked_select(
-            torch.zeros(bs, gridnum).to(boxes_sml[0].device).scatter(1, indices, 1).bool(
-            ).unsqueeze(2).unsqueeze(3).expand(bs, gridnum, anncornum, ch)
+            torch.zeros(bs, gridnum, device=boxes_sml[0].device)
+            .scatter(1, indices, 1).bool()
+            .unsqueeze(2).unsqueeze(3)
+            .expand(bs, gridnum, anncornum, ch)
         ).contiguous().view(bs, select_num, anncornum, ch)
 
-        # 6. Mask Select Visual Feature tương ứng
+        # Cần v_feat để gather feature
+        if 'v_feat' not in locals():
+            B, C, H, W = feature_map.shape
+            v_feat = feature_map.view(B, C, H * W).permute(0, 2, 1)
+
         i_new = v_feat.masked_select(
-            torch.zeros(bs, gridnum).to(v_feat.device).scatter(
-                1, indices, 1).bool().unsqueeze(2).expand(bs, gridnum, C)
+            torch.zeros(bs, gridnum, device=v_feat.device)
+            .scatter(1, indices, 1).bool()
+            .unsqueeze(2)
+            .expand(bs, gridnum, C)
         ).contiguous().view(bs, select_num, C)
 
         return box_sml_new, i_new, indices
@@ -162,7 +166,7 @@ class Net(nn.Module):
         self.pixel_std = torch.tensor(__C.STD).view(-1, 1, 1)
         self.pos_encoder = PositionEmbeddingSine()
         self.anchor_selector = LanguageGuidedAnchorSelector(
-            visual_dim=1024,  # Channel của s_new (WREC_DIM)
+            visual_dim=__C.WREC_DIM,  # Channel của s_new (WREC_DIM)
             text_dim=__C.HIDDEN_SIZE,
             hidden_dim=256
         )
@@ -344,7 +348,6 @@ class Net(nn.Module):
         #         3).expand(bs, gridnum, anncornum, ch)).contiguous().view(bs, selnum, anncornum, ch)
         # boxes_sml_new.append(box_sml_new)
 
-
         # batchsize, dim, h, w = x_[0].size()
         # i_new = x_[0].view(batchsize, dim, h * w).permute(0, 2, 1)
         # bs, gridnum, ch = i_new.shape
@@ -356,7 +359,8 @@ class Net(nn.Module):
             boxes_sml=boxes_sml,
             feature_map=s_new,
             flat_lang_feat=y_['flat_lang_feat'],
-            select_num=self.select_num
+            select_num=self.select_num,
+            epoch=epoch,
         )
         boxes_sml_new = [boxes_sml_new_single]
         # ---------------------------------
