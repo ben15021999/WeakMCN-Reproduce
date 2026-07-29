@@ -12,44 +12,65 @@ import torch.nn.functional as F
 from transformers import Dinov2Model
 
 
-class VLCrossAttention(nn.Module):
-    def __init__(self, d_model, nhead=8, dropout=0.1):
-        super(VLCrossAttention, self).__init__()
-        # Cross Attention Module standard: Query = Vision, Key/Value = Language
-        self.multihead_attn = nn.MultiheadAttention(
-            embed_dim=d_model, num_heads=nhead, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+class LanguageGuidedAnchorSelector(nn.Module):
+    def __init__(self, visual_dim, text_dim, hidden_dim=256):
+        super().__init__()
+        # Project cả Vision và Text về cùng không gian nhúng (Embedding Space)
+        self.v_proj = nn.Linear(visual_dim, hidden_dim)
+        self.t_proj = nn.Linear(text_dim, hidden_dim)
+        # Cổng trọng số linh hoạt (Gate) để cân bằng giữa YOLO score và Text score
+        self.alpha = nn.Parameter(torch.tensor(0.5))
 
-        # Feed-forward network đơn giản để điều chỉnh lại feature
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 2, d_model)
-        )
-        self.norm_ffn = nn.LayerNorm(d_model)
-
-    def forward(self, vision_feat, lang_feat):
+    def forward(self, boxes_sml, feature_map, flat_lang_feat, select_num):
         """
-        vision_feat: Tensor shape (B, N_v, d_model)  [với Anchor Box] hoặc (B, H*W, d_model) [với Spatial Feature]
-        lang_feat:   Tensor shape (B, N_l, d_model)  [chuỗi từ/words trong câu text]
+        boxes_sml: [B, gridnum, anncornum, ch] (ch có channel 4 là conf score)
+        feature_map (s_new): [B, C, H, W]
+        flat_lang_feat: [B, text_dim]
         """
-        # 1. Multi-Head Cross Attention
-        # Vision đóng vai trò Query, Language đóng vai trò Key và Value
-        attn_out, _ = self.multihead_attn(
-            query=vision_feat, key=lang_feat, value=lang_feat)
+        bs, gridnum, anncornum, ch = boxes_sml[0].shape
 
-        # Residual connection & LayerNorm
-        x = vision_feat + self.dropout(attn_out)
-        x = self.norm(x)
+        # 1. Lấy Objectness Score từ YOLOv3 (như cũ)
+        yolo_score = torch.mean(boxes_sml[0], dim=2)[:, :, 4]  # [B, gridnum]
+        yolo_score = torch.sigmoid(yolo_score)  # Normalization về [0, 1]
 
-        # 2. Feed-Forward Network (FFN)
-        ffn_out = self.ffn(x)
-        x = x + self.dropout(ffn_out)
-        x = self.norm_ffn(x)
+        # 2. Tính Text-Visual Alignment Score cho từng Grid Cell
+        # Reshape feature_map từ (B, C, H, W) thành (B, H*W, C) -> (B, gridnum, visual_dim)
+        B, C, H, W = feature_map.shape
+        v_feat = feature_map.view(
+            B, C, H * W).permute(0, 2, 1)  # [B, gridnum, C]
 
-        return x
+        # [B, gridnum, hidden_dim]
+        v_emb = F.normalize(self.v_proj(v_feat), p=2, dim=-1)
+        t_emb = F.normalize(self.t_proj(flat_lang_feat),
+                            p=2, dim=-1)   # [B, hidden_dim]
+
+        # Cosine Similarity giữa từng Anchor Cell và Câu Text
+        # (B, gridnum, hidden_dim) x (B, hidden_dim, 1) -> (B, gridnum)
+        text_sim_score = torch.bmm(v_emb, t_emb.unsqueeze(2)).squeeze(2)
+        text_sim_score = (text_sim_score + 1) / 2  # Scale về [0, 1]
+
+        # 3. Kết hợp 2 điểm số (Hybrid Score)
+        # alpha kiểm soát mức độ ưu tiên giữa YOLO score và Text Similarity
+        gate = torch.sigmoid(self.alpha)
+        final_score = gate * yolo_score + (1 - gate) * text_sim_score
+
+        # 4. Top-K Selection dựa trên Final Score
+        vals, indices = final_score.topk(
+            k=int(select_num), dim=1, largest=True, sorted=True)
+
+        # 5. Mask Select Anchor Box
+        box_sml_new = boxes_sml[0].masked_select(
+            torch.zeros(bs, gridnum).to(boxes_sml[0].device).scatter(1, indices, 1).bool(
+            ).unsqueeze(2).unsqueeze(3).expand(bs, gridnum, anncornum, ch)
+        ).contiguous().view(bs, select_num, anncornum, ch)
+
+        # 6. Mask Select Visual Feature tương ứng
+        i_new = v_feat.masked_select(
+            torch.zeros(bs, gridnum).to(v_feat.device).scatter(
+                1, indices, 1).bool().unsqueeze(2).expand(bs, gridnum, C)
+        ).contiguous().view(bs, select_num, C)
+
+        return box_sml_new, i_new, indices
 
 
 class PositionEmbeddingSine(nn.Module):
@@ -140,9 +161,11 @@ class Net(nn.Module):
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
         self.pixel_std = torch.tensor(__C.STD).view(-1, 1, 1)
         self.pos_encoder = PositionEmbeddingSine()
-        # THÊM MỚI: Cross Attention cho REC (Detection)
-        self.rec_vl_cross_attn = VLCrossAttention(
-            d_model=__C.HIDDEN_SIZE, nhead=8)
+        self.anchor_selector = LanguageGuidedAnchorSelector(
+            visual_dim=1024,  # Channel của s_new (WREC_DIM)
+            text_dim=__C.HIDDEN_SIZE,
+            hidden_dim=256
+        )
 
         # Nếu muốn đổi chiều feature của y thành HIDDEN_SIZE trước khi đưa vào Cross-Attn
         # Điều chỉnh 512 theo dim thực tế của lang_feat
@@ -309,42 +332,39 @@ class Net(nn.Module):
 
         x_ = [s_new, m_new, l_new]
         # Anchor Selection
-        boxes_sml_new = []
-        mean_i = torch.mean(boxes_sml[0], dim=2, keepdim=True)
-        mean_i = mean_i.squeeze(2)[:, :, 4]
-        vals, indices = mean_i.topk(
-            k=int(self.select_num), dim=1, largest=True, sorted=True)
-        bs, gridnum, anncornum, ch = boxes_sml[0].shape
-        bs_, selnum = indices.shape
-        box_sml_new = boxes_sml[0].masked_select(
-            torch.zeros(bs, gridnum).to(boxes_sml[0].device).scatter(1, indices, 1).bool().unsqueeze(2).unsqueeze(
-                3).expand(bs, gridnum, anncornum, ch)).contiguous().view(bs, selnum, anncornum, ch)
-        boxes_sml_new.append(box_sml_new)
+        # boxes_sml_new = []
+        # mean_i = torch.mean(boxes_sml[0], dim=2, keepdim=True)
+        # mean_i = mean_i.squeeze(2)[:, :, 4]
+        # vals, indices = mean_i.topk(
+        #     k=int(self.select_num), dim=1, largest=True, sorted=True)
+        # bs, gridnum, anncornum, ch = boxes_sml[0].shape
+        # bs_, selnum = indices.shape
+        # box_sml_new = boxes_sml[0].masked_select(
+        #     torch.zeros(bs, gridnum).to(boxes_sml[0].device).scatter(1, indices, 1).bool().unsqueeze(2).unsqueeze(
+        #         3).expand(bs, gridnum, anncornum, ch)).contiguous().view(bs, selnum, anncornum, ch)
+        # boxes_sml_new.append(box_sml_new)
 
-        # chỗ này gắn cái SAM2 vô để refine lại cái bbox
-        batchsize, dim, h, w = x_[0].size()
-        i_new = x_[0].view(batchsize, dim, h * w).permute(0, 2, 1)
-        bs, gridnum, ch = i_new.shape
-        i_new = i_new.masked_select(
-            torch.zeros(bs, gridnum).to(i_new.device).scatter(1, indices, 1).
-            bool().unsqueeze(2).expand(bs, gridnum, ch)).contiguous().view(bs, selnum, ch)
+
+        # batchsize, dim, h, w = x_[0].size()
+        # i_new = x_[0].view(batchsize, dim, h * w).permute(0, 2, 1)
+        # bs, gridnum, ch = i_new.shape
+        # i_new = i_new.masked_select(
+        #     torch.zeros(bs, gridnum).to(i_new.device).scatter(1, indices, 1).
+        #     bool().unsqueeze(2).expand(bs, gridnum, ch)).contiguous().view(bs, selnum, ch)
+        # --- ANCHOR SELECTION CẢI TIẾN ---
+        boxes_sml_new_single, i_new, indices = self.anchor_selector(
+            boxes_sml=boxes_sml,
+            feature_map=s_new,
+            flat_lang_feat=y_['flat_lang_feat'],
+            select_num=self.select_num
+        )
+        boxes_sml_new = [boxes_sml_new_single]
+        # ---------------------------------
 
         # Anchor-based Contrastive Learning
         x_new = self.linear_vs(i_new)
         position_embedding = self.get_position_embedding(boxes_sml_new[0])
         x_new = x_new + position_embedding
-        # --- BẮT ĐẦU CHÈN CROSS ATTENTION ---
-        # 1. Lấy ngữ cảnh đầy đủ của câu văn (seq_len x dim)
-        # Giả sử y_['flat_lang_feat'] có shape (B, 512) hoặc y_ chứa word-level embeddings shape (B, Seq_len, 512)
-        lang_seq_feat = y_['flat_lang_feat'].unsqueeze(1)  # [B, 1, 512]
-        lang_seq_feat = self.linear_lang_proj(
-            lang_seq_feat)  # [B, 1, HIDDEN_SIZE]
-
-        # 2. Thực hiện Cross-Attention giữa Vision (x_new) và Text (lang_seq_feat)
-        x_new = self.rec_vl_cross_attn(
-            vision_feat=x_new, lang_feat=lang_seq_feat)
-        # --- KẾT THÚC CHÈN CROSS ATTENTION ---
-
         y_new = self.linear_ts(y_['flat_lang_feat'].unsqueeze(1))
 
         x_sup = [l_new, m_new, s_new]
