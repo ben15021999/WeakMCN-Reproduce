@@ -358,7 +358,7 @@ def main_worker(gpu, __C):
 
     if os.path.isfile(__C.RESUME_PATH):
         checkpoint = torch.load(
-            __C.RESUME_PATH, map_location=lambda storage, loc: storage.cuda())
+            __C.RESUME_PATH, map_location=lambda storage, loc: storage.cuda(), weights_only=False)
         new_dict = {}
         for k in checkpoint['state_dict']:
             if 'module.' in k:
