@@ -13,14 +13,11 @@ from transformers import Dinov2Model
 
 
 class LanguageGuidedAnchorSelector(nn.Module):
-    def __init__(self, visual_dim=512, text_dim=512, hidden_dim=256):
+    def __init__(self, visual_dim=512, text_dim=512, hidden_dim=256, alpha=0.2):
         super().__init__()
         self.v_proj = nn.Linear(visual_dim, hidden_dim)
         self.t_proj = nn.Linear(text_dim, hidden_dim)
-        self.alpha = nn.Parameter(torch.tensor(3.0))
-        # Zero-init weights của t_proj để ban đầu không tạo ra noise làm hỏng Anchor Selection
-        nn.init.zeros_(self.t_proj.weight)
-        nn.init.zeros_(self.t_proj.bias)
+        self.alpha = alpha
 
     def forward(self, boxes_sml, feature_map, flat_lang_feat, select_num, epoch=None):
         bs, gridnum, anncornum, ch = boxes_sml[0].shape
@@ -29,26 +26,21 @@ class LanguageGuidedAnchorSelector(nn.Module):
         yolo_score = torch.mean(boxes_sml[0], dim=2)[:, :, 4]
         yolo_score = torch.sigmoid(yolo_score)
 
-        # ĐIỀU KIỆN AN TOÀN: Ở Epoch 0 khi ĐÁNH GIÁ (eval/val), dùng 100% YOLO Score
-        # Điều này giúp IoU ở Epoch 0 Val không bao giờ bị rớt thảm hại
-        if (epoch is not None and epoch == 0 and not self.training):
+        if epoch == 0:
             final_score = yolo_score
         else:
-            # 2. Tính Text-Visual Similarity
             B, C, H, W = feature_map.shape
-            v_feat = feature_map.view(
-                B, C, H * W).permute(0, 2, 1)  # [B, gridnum, C]
+            v_feat = feature_map.view(B, C, H * W).permute(0, 2, 1)
 
             v_emb = self.v_proj(v_feat)
             t_emb = self.t_proj(flat_lang_feat)
 
-            # Dot product
             raw_dot_product = torch.bmm(v_emb, t_emb.unsqueeze(2)).squeeze(2)
             text_sim_score = torch.sigmoid(raw_dot_product)
 
-            # 3. Kết hợp bằng Gate tự học
-            gate = torch.sigmoid(self.alpha)  # Ban đầu gate ≈ 0.95
-            final_score = gate * yolo_score + (1 - gate) * text_sim_score
+            # Trộn score theo alpha
+            final_score = (1.0 - self.alpha) * yolo_score + \
+                self.alpha * text_sim_score
 
         # 4. Top-K Selection
         vals, indices = final_score.topk(
