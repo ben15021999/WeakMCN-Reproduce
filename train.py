@@ -273,8 +273,8 @@ def main_worker(gpu, __C):
                 new_dict[new_k] = checkpoint['state_dict'][k]
         if len(new_dict.keys()) == 0:
             new_dict = checkpoint['state_dict']
-        # net.load_state_dict(checkpoint['state_dict'])
-        net.load_state_dict(new_dict)
+        net.load_state_dict(checkpoint['state_dict'])
+        # net.load_state_dict(new_dict)
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
         start_epoch = checkpoint['epoch']

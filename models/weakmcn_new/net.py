@@ -21,31 +21,44 @@ class LanguageGuidedAnchorSelector(nn.Module):
 
     def forward(self, boxes_sml, feature_map, flat_lang_feat, select_num, epoch=None):
         bs, gridnum, anncornum, ch = boxes_sml[0].shape
+        device = boxes_sml[0].device
 
         # 1. Objectness score từ YOLOv3 (Khoảng [0, 1])
         yolo_score = torch.mean(boxes_sml[0], dim=2)[:, :, 4]
         yolo_score = torch.sigmoid(yolo_score)
 
-        if epoch == 0:
+        # 2. Reshape visual feature đồng bộ theo spatial grid (B, H*W, C)
+        B, C, H, W = feature_map.shape
+        v_feat = feature_map.view(B, C, H * W).permute(0, 2, 1)
+
+        assert gridnum == H * W, f"Gridnum ({gridnum}) mismatch with Feature Map Spatial Size ({H*W})"
+
+        # 3. Tính điểm tương quan KHÔNG NORMALIZE
+        if epoch is None or epoch == 0:
             final_score = yolo_score
         else:
-            B, C, H, W = feature_map.shape
-            v_feat = feature_map.view(B, C, H * W).permute(0, 2, 1)
+            # Linear projection giữ nguyên magnitude
+            v_emb = self.v_proj(v_feat)                   # Shape: [B, H*W, hidden_dim]
+            t_emb = self.t_proj(flat_lang_feat)           # Shape: [B, hidden_dim]
 
-            v_emb = self.v_proj(v_feat)
-            t_emb = self.t_proj(flat_lang_feat)
+            # Raw Dot Product (Tích vô hướng trực tiếp)
+            raw_dot_product = torch.bmm(v_emb, t_emb.unsqueeze(2)).squeeze(2)  # Shape: [B, H*W]
 
-            raw_dot_product = torch.bmm(v_emb, t_emb.unsqueeze(2)).squeeze(2)
+            # Dùng Sigmoid nén giá trị dot product về khoảng [0, 1]
             text_sim_score = torch.sigmoid(raw_dot_product)
 
-            # Trộn score theo alpha
-            final_score = (1.0 - self.alpha) * yolo_score + \
-                self.alpha * text_sim_score
+            # Trộn điểm theo phép nhân để bảo đảm Objectness của YOLO
+            final_score = yolo_score * (1.0 + self.alpha * text_sim_score)
 
         # 4. Top-K Selection
-        vals, indices = final_score.topk(
-            k=int(select_num), dim=1, largest=True, sorted=True)
+        vals, indices = final_score.topk(k=int(select_num), dim=1, largest=True, sorted=True)
 
+        # 5. Gather Anchors và Features theo indices chính xác
+        # indices_box = indices.unsqueeze(-1).unsqueeze(-1).expand(bs, select_num, anncornum, ch)
+        # box_sml_new = torch.gather(boxes_sml[0], dim=1, index=indices_box)
+
+        # indices_feat = indices.unsqueeze(-1).expand(bs, select_num, C)
+        # i_new = torch.gather(v_feat, dim=1, index=indices_feat)
         # 5. Gather Anchors và Visual Feature Map theo indices
         box_sml_new = boxes_sml[0].masked_select(
             torch.zeros(bs, gridnum, device=boxes_sml[0].device)
