@@ -34,31 +34,23 @@ class LanguageGuidedAnchorSelector(nn.Module):
         assert gridnum == H * W, f"Gridnum ({gridnum}) mismatch with Feature Map Spatial Size ({H*W})"
 
         # 3. Tính điểm tương quan KHÔNG NORMALIZE
-        if epoch is None or epoch == 0:
-            final_score = yolo_score
-        else:
-            # Linear projection giữ nguyên magnitude
-            v_emb = self.v_proj(v_feat)                   # Shape: [B, H*W, hidden_dim]
-            t_emb = self.t_proj(flat_lang_feat)           # Shape: [B, hidden_dim]
+        
+        # Linear projection giữ nguyên magnitude
+        v_emb = self.v_proj(v_feat)                   # Shape: [B, H*W, hidden_dim]
+        t_emb = self.t_proj(flat_lang_feat)           # Shape: [B, hidden_dim]
 
-            # Raw Dot Product (Tích vô hướng trực tiếp)
-            raw_dot_product = torch.bmm(v_emb, t_emb.unsqueeze(2)).squeeze(2)  # Shape: [B, H*W]
+        # Raw Dot Product (Tích vô hướng trực tiếp)
+        raw_dot_product = torch.bmm(v_emb, t_emb.unsqueeze(2)).squeeze(2)  # Shape: [B, H*W]
 
-            # Dùng Sigmoid nén giá trị dot product về khoảng [0, 1]
-            text_sim_score = torch.sigmoid(raw_dot_product)
+        # Dùng Sigmoid nén giá trị dot product về khoảng [0, 1]
+        text_sim_score = torch.sigmoid(raw_dot_product)
 
-            # Trộn điểm theo phép nhân để bảo đảm Objectness của YOLO
-            final_score = yolo_score * (1.0 + self.alpha * text_sim_score)
+        # Trộn điểm theo phép nhân để bảo đảm Objectness của YOLO
+        final_score = yolo_score * (1.0 + self.alpha * text_sim_score)
 
         # 4. Top-K Selection
         vals, indices = final_score.topk(k=int(select_num), dim=1, largest=True, sorted=True)
 
-        # 5. Gather Anchors và Features theo indices chính xác
-        # indices_box = indices.unsqueeze(-1).unsqueeze(-1).expand(bs, select_num, anncornum, ch)
-        # box_sml_new = torch.gather(boxes_sml[0], dim=1, index=indices_box)
-
-        # indices_feat = indices.unsqueeze(-1).expand(bs, select_num, C)
-        # i_new = torch.gather(v_feat, dim=1, index=indices_feat)
         # 5. Gather Anchors và Visual Feature Map theo indices
         box_sml_new = boxes_sml[0].masked_select(
             torch.zeros(bs, gridnum, device=boxes_sml[0].device)
