@@ -41,20 +41,4 @@ class WeakREChead(nn.Module):
         target_pred = torch.argmax(target, dim=1)
         loss = nn.CrossEntropyLoss(reduction="mean")(new_logits, target_pred)
 
-        # ====== Batch Hard Negative ======
-        img_score = sim_map.max(dim=-1).values.mean(dim=-1)   # [B,B]
-
-        pos_score = img_score.diag()
-
-        neg_score = img_score.clone()
-        neg_score.fill_diagonal_(-1e9)
-
-        hard_neg = neg_score.max(dim=1).values
-
-        hard_logits = torch.stack([pos_score, hard_neg], dim=1)
-
-        hard_loss = F.cross_entropy(
-            hard_logits,
-            torch.zeros(B, dtype=torch.long, device=vis_emb.device)
-        )
-        return loss + 0.2 * hard_loss
+        return loss

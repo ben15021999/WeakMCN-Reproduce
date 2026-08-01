@@ -12,6 +12,20 @@ import math
 import torch.nn.functional as F
 from transformers import Dinov2Model
 
+
+class FiLM(nn.Module):
+    def __init__(self, lang_dim, feat_dim):
+        super().__init__()
+
+        self.gamma = nn.Linear(lang_dim, feat_dim)
+        self.beta = nn.Linear(lang_dim, feat_dim)
+
+    def forward(self, feat, lang):
+        gamma = self.gamma(lang).unsqueeze(-1).unsqueeze(-1)
+        beta = self.beta(lang).unsqueeze(-1).unsqueeze(-1)
+
+        return feat * (1 + gamma) + beta
+
 class PositionEmbeddingSine(nn.Module):
     """
     This is a more standard version of the position embedding, very similar to the one
@@ -78,6 +92,10 @@ class Net(nn.Module):
             ]
         )
         self.attention_manner = GaranAttention(512, __C.WRES_DIM)
+
+        self.film_s = FiLM(256, __C.WREC_DIM)
+        self.film_m = FiLM(512, __C.WREC_DIM)
+        self.film_l = FiLM(1024, __C.WREC_DIM)
 
         # load ESAM model
         if __C.USE_VITS:
@@ -215,6 +233,10 @@ class Net(nn.Module):
         x_input = [l, m, s]
         l_new, m_new, s_new = self.multi_scale_manner(x_input)
 
+        s_new = self.film_s(s_new, y_['flat_lang_feat'])
+        m_new = self.film_m(m_new, y_['flat_lang_feat'])
+        l_new = self.film_l(l_new, y_['flat_lang_feat'])
+
         # Dynamic routing
         rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(
             0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
@@ -273,7 +295,6 @@ class Net(nn.Module):
                 3).expand(bs, gridnum, anncornum, ch)).contiguous().view(bs, selnum, anncornum, ch)
         boxes_sml_new.append(box_sml_new)
 
-        # chỗ này gắn cái SAM2 vô để refine lại cái bbox
         batchsize, dim, h, w = x_[0].size()
         i_new = x_[0].view(batchsize, dim, h * w).permute(0, 2, 1)
         bs, gridnum, ch = i_new.shape
