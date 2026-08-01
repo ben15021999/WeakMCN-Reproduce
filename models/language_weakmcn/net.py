@@ -13,19 +13,6 @@ import torch.nn.functional as F
 from transformers import Dinov2Model
 
 
-class FiLM(nn.Module):
-    def __init__(self, lang_dim, feat_dim):
-        super().__init__()
-
-        self.gamma = nn.Linear(lang_dim, feat_dim)
-        self.beta = nn.Linear(lang_dim, feat_dim)
-
-    def forward(self, feat, lang):
-        gamma = self.gamma(lang).unsqueeze(-1).unsqueeze(-1)
-        beta = self.beta(lang).unsqueeze(-1).unsqueeze(-1)
-
-        return feat * (1 + gamma) + beta
-
 class PositionEmbeddingSine(nn.Module):
     """
     This is a more standard version of the position embedding, very similar to the one
@@ -93,9 +80,23 @@ class Net(nn.Module):
         )
         self.attention_manner = GaranAttention(512, __C.WRES_DIM)
 
-        self.film_s = FiLM(256, __C.WREC_DIM)
-        self.film_m = FiLM(512, __C.WREC_DIM)
-        self.film_l = FiLM(1024, __C.WREC_DIM)
+        self.anchor_cross_attn = nn.MultiheadAttention(
+            embed_dim=__C.HIDDEN_SIZE,
+            num_heads=8,
+            dropout=0.1,
+            batch_first=True
+        )
+
+        self.anchor_norm1 = nn.LayerNorm(__C.HIDDEN_SIZE)
+
+        self.anchor_ffn = nn.Sequential(
+            nn.Linear(__C.HIDDEN_SIZE, __C.HIDDEN_SIZE * 4),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(__C.HIDDEN_SIZE * 4, __C.HIDDEN_SIZE)
+        )
+
+        self.anchor_norm2 = nn.LayerNorm(__C.HIDDEN_SIZE)
 
         # load ESAM model
         if __C.USE_VITS:
@@ -233,10 +234,6 @@ class Net(nn.Module):
         x_input = [l, m, s]
         l_new, m_new, s_new = self.multi_scale_manner(x_input)
 
-        s_new = self.film_s(s_new, y_['flat_lang_feat'])
-        m_new = self.film_m(m_new, y_['flat_lang_feat'])
-        l_new = self.film_l(l_new, y_['flat_lang_feat'])
-
         # Dynamic routing
         rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(
             0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
@@ -286,6 +283,7 @@ class Net(nn.Module):
         boxes_sml_new = []
         mean_i = torch.mean(boxes_sml[0], dim=2, keepdim=True)
         mean_i = mean_i.squeeze(2)[:, :, 4]
+
         vals, indices = mean_i.topk(
             k=int(self.select_num), dim=1, largest=True, sorted=True)
         bs, gridnum, anncornum, ch = boxes_sml[0].shape
@@ -306,6 +304,18 @@ class Net(nn.Module):
         x_new = self.linear_vs(i_new)
         position_embedding = self.get_position_embedding(boxes_sml_new[0])
         x_new = x_new + position_embedding
+        lang_tokens = self.linear_ts(
+            y_['lang_feat']
+        )
+        context, attn = self.anchor_cross_attn(
+            query=x_new,
+            key=lang_tokens,
+            value=lang_tokens
+        )
+        x_new = self.anchor_norm1(x_new + context)
+        ffn = self.anchor_ffn(x_new)
+        x_new = self.anchor_norm2(x_new + ffn)
+
         y_new = self.linear_ts(y_['flat_lang_feat'].unsqueeze(1))
 
         x_sup = [l_new, m_new, s_new]
