@@ -12,6 +12,67 @@ import torch.nn.functional as F
 from transformers import Dinov2Model
 
 
+# class LanguageGuidedAnchorSelector(nn.Module):
+#     def __init__(self, visual_dim=512, text_dim=512, hidden_dim=256, alpha=0.2):
+#         super().__init__()
+#         self.v_proj = nn.Linear(visual_dim, hidden_dim)
+#         self.t_proj = nn.Linear(text_dim, hidden_dim)
+#         self.alpha = alpha
+
+#     def forward(self, boxes_sml, feature_map, flat_lang_feat, select_num, epoch=None):
+#         bs, gridnum, anncornum, ch = boxes_sml[0].shape
+#         device = boxes_sml[0].device
+
+#         # 1. Objectness score từ YOLOv3 (Khoảng [0, 1])
+#         yolo_score = torch.mean(boxes_sml[0], dim=2)[:, :, 4]
+#         yolo_score = torch.sigmoid(yolo_score)
+
+#         # 2. Reshape visual feature đồng bộ theo spatial grid (B, H*W, C)
+#         B, C, H, W = feature_map.shape
+#         v_feat = feature_map.view(B, C, H * W).permute(0, 2, 1)
+
+#         assert gridnum == H * W, f"Gridnum ({gridnum}) mismatch with Feature Map Spatial Size ({H*W})"
+
+#         # 3. Tính điểm tương quan KHÔNG NORMALIZE
+        
+#         # Linear projection giữ nguyên magnitude
+#         v_emb = self.v_proj(v_feat)                   # Shape: [B, H*W, hidden_dim]
+#         t_emb = self.t_proj(flat_lang_feat)           # Shape: [B, hidden_dim]
+
+#         # Raw Dot Product (Tích vô hướng trực tiếp)
+#         raw_dot_product = torch.bmm(v_emb, t_emb.unsqueeze(2)).squeeze(2)  # Shape: [B, H*W]
+
+#         # Dùng Sigmoid nén giá trị dot product về khoảng [0, 1]
+#         text_sim_score = torch.sigmoid(raw_dot_product)
+
+#         # Trộn điểm theo phép nhân để bảo đảm Objectness của YOLO
+#         final_score = yolo_score * (1.0 + self.alpha * text_sim_score)
+
+#         # 4. Top-K Selection
+#         vals, indices = final_score.topk(k=int(select_num), dim=1, largest=True, sorted=True)
+
+#         # 5. Gather Anchors và Visual Feature Map theo indices
+#         box_sml_new = boxes_sml[0].masked_select(
+#             torch.zeros(bs, gridnum, device=boxes_sml[0].device)
+#             .scatter(1, indices, 1).bool()
+#             .unsqueeze(2).unsqueeze(3)
+#             .expand(bs, gridnum, anncornum, ch)
+#         ).contiguous().view(bs, select_num, anncornum, ch)
+
+#         # Cần v_feat để gather feature
+#         if 'v_feat' not in locals():
+#             B, C, H, W = feature_map.shape
+#             v_feat = feature_map.view(B, C, H * W).permute(0, 2, 1)
+
+#         i_new = v_feat.masked_select(
+#             torch.zeros(bs, gridnum, device=v_feat.device)
+#             .scatter(1, indices, 1).bool()
+#             .unsqueeze(2)
+#             .expand(bs, gridnum, C)
+#         ).contiguous().view(bs, select_num, C)
+
+#         return box_sml_new, i_new, indices
+
 class LanguageGuidedAnchorSelector(nn.Module):
     def __init__(self, visual_dim=512, text_dim=512, hidden_dim=256, alpha=0.2):
         super().__init__()
@@ -19,59 +80,62 @@ class LanguageGuidedAnchorSelector(nn.Module):
         self.t_proj = nn.Linear(text_dim, hidden_dim)
         self.alpha = alpha
 
-    def forward(self, boxes_sml, feature_map, flat_lang_feat, select_num, epoch=None):
-        bs, gridnum, anncornum, ch = boxes_sml[0].shape
-        device = boxes_sml[0].device
+        # Khoong khoi tao zeros cho weight va bias de tuong tac ngon ngu - thi giac hoat dong tu dau
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.t_proj.weight)
 
-        # 1. Objectness score từ YOLOv3 (Khoảng [0, 1])
+    def forward(self, boxes_sml, feature_map, flat_lang_feat, select_num, epoch=None):
+        """
+        Args:
+            boxes_sml: List chua Tensor (BS, GridNum, AnnCorNum, Ch)
+            feature_map: Tensor (BS, C, H, W) - Feature map visual (x_[0] / s_new)
+            flat_lang_feat: Tensor (BS, Text_Dim) - Text embedding
+            select_num: int - So luong Anchor can chon (Top-K)
+            epoch: int (Optional) - Dung de Warm-up
+        """
+        bs, gridnum, anncornum, ch = boxes_sml[0].shape
+        B, C, H, W = feature_map.shape
+
+        assert gridnum == H * \
+            W, f"Gridnum ({gridnum}) không khớp với Spatial Size ({H*W})"
+
+        # 1. FIX SPATIAL ALIGNMENT: Giữ đúng vị trí tọa độ ô Grid (B, H*W, C)
+        v_feat = feature_map.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
+
+        # 2. Objectness Score từ YOLOv3
         yolo_score = torch.mean(boxes_sml[0], dim=2)[:, :, 4]
         yolo_score = torch.sigmoid(yolo_score)
 
-        # 2. Reshape visual feature đồng bộ theo spatial grid (B, H*W, C)
-        B, C, H, W = feature_map.shape
-        v_feat = feature_map.view(B, C, H * W).permute(0, 2, 1)
+        # 3. Tính Language-Guided Score
+        v_emb = self.v_proj(v_feat)                 # [B, H*W, hidden_dim]
+        t_emb = self.t_proj(flat_lang_feat)         # [B, hidden_dim]
 
-        assert gridnum == H * W, f"Gridnum ({gridnum}) mismatch with Feature Map Spatial Size ({H*W})"
+        # Raw Dot Product
+        raw_dot_product = torch.bmm(
+            v_emb, t_emb.unsqueeze(2)).squeeze(2)  # [B, H*W]
 
-        # 3. Tính điểm tương quan KHÔNG NORMALIZE
-        
-        # Linear projection giữ nguyên magnitude
-        v_emb = self.v_proj(v_feat)                   # Shape: [B, H*W, hidden_dim]
-        t_emb = self.t_proj(flat_lang_feat)           # Shape: [B, hidden_dim]
+        # Scale theo root(d)
+        scale = (v_emb.shape[-1]) ** 0.5
+        text_sim_score = torch.sigmoid(raw_dot_product / scale)
 
-        # Raw Dot Product (Tích vô hướng trực tiếp)
-        raw_dot_product = torch.bmm(v_emb, t_emb.unsqueeze(2)).squeeze(2)  # Shape: [B, H*W]
-
-        # Dùng Sigmoid nén giá trị dot product về khoảng [0, 1]
-        text_sim_score = torch.sigmoid(raw_dot_product)
-
-        # Trộn điểm theo phép nhân để bảo đảm Objectness của YOLO
-        final_score = yolo_score * (1.0 + self.alpha * text_sim_score)
+        # Kết hợp tuyến tính giữ vững Objectness của YOLO
+        final_score = (1.0 - self.alpha) * yolo_score + \
+            self.alpha * (yolo_score * text_sim_score)
 
         # 4. Top-K Selection
-        vals, indices = final_score.topk(k=int(select_num), dim=1, largest=True, sorted=True)
+        vals, indices = final_score.topk(
+            k=int(select_num), dim=1, largest=True, sorted=True)
 
-        # 5. Gather Anchors và Visual Feature Map theo indices
-        box_sml_new = boxes_sml[0].masked_select(
-            torch.zeros(bs, gridnum, device=boxes_sml[0].device)
-            .scatter(1, indices, 1).bool()
-            .unsqueeze(2).unsqueeze(3)
-            .expand(bs, gridnum, anncornum, ch)
-        ).contiguous().view(bs, select_num, anncornum, ch)
+        # 5. FIX GATHER LOGIC: Dùng torch.gather để GIỮ ĐÚNG THỨ TỰ UƯ TIÊN Top-1, Top-2...
+        indices_box = indices.unsqueeze(-1).unsqueeze(-1).expand(bs,
+                                                                 int(select_num), anncornum, ch)
+        box_sml_new = torch.gather(boxes_sml[0], dim=1, index=indices_box)
 
-        # Cần v_feat để gather feature
-        if 'v_feat' not in locals():
-            B, C, H, W = feature_map.shape
-            v_feat = feature_map.view(B, C, H * W).permute(0, 2, 1)
+        indices_feat = indices.unsqueeze(-1).expand(bs, int(select_num), C)
+        i_new = torch.gather(v_feat, dim=1, index=indices_feat)
 
-        i_new = v_feat.masked_select(
-            torch.zeros(bs, gridnum, device=v_feat.device)
-            .scatter(1, indices, 1).bool()
-            .unsqueeze(2)
-            .expand(bs, gridnum, C)
-        ).contiguous().view(bs, select_num, C)
-
-        return box_sml_new, i_new, indices
+        # Đưa box_sml_new về dạng List[Tensor] để đồng bộ cấu trúc cũ
+        return [box_sml_new], i_new, indices
 
 
 class PositionEmbeddingSine(nn.Module):
@@ -352,14 +416,13 @@ class Net(nn.Module):
         #     torch.zeros(bs, gridnum).to(i_new.device).scatter(1, indices, 1).
         #     bool().unsqueeze(2).expand(bs, gridnum, ch)).contiguous().view(bs, selnum, ch)
         # --- ANCHOR SELECTION CẢI TIẾN ---
-        boxes_sml_new_single, i_new, indices = self.anchor_selector(
+        boxes_sml_new, i_new, indices = self.anchor_selector(
             boxes_sml=boxes_sml,
-            feature_map=s_new,
+            feature_map=x_[0],
             flat_lang_feat=y_['flat_lang_feat'],
             select_num=self.select_num,
-            epoch=epoch,
+            epoch=epoch
         )
-        boxes_sml_new = [boxes_sml_new_single]
         # ---------------------------------
 
         # Anchor-based Contrastive Learning
