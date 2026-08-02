@@ -50,6 +50,7 @@ class PositionEmbeddingSine(nn.Module):
         pos = torch.cat((pos_y, pos_x), dim=2)
         return pos
 
+
 class Net(nn.Module):
     def __init__(self, __C, pretrained_emb, token_size):
         super(Net, self).__init__()
@@ -80,23 +81,7 @@ class Net(nn.Module):
         )
         self.attention_manner = GaranAttention(512, __C.WRES_DIM)
 
-        self.anchor_cross_attn = nn.MultiheadAttention(
-            embed_dim=__C.HIDDEN_SIZE,
-            num_heads=8,
-            dropout=0.1,
-            batch_first=True
-        )
-
-        self.anchor_norm1 = nn.LayerNorm(__C.HIDDEN_SIZE)
-
-        self.anchor_ffn = nn.Sequential(
-            nn.Linear(__C.HIDDEN_SIZE, __C.HIDDEN_SIZE * 4),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(__C.HIDDEN_SIZE * 4, __C.HIDDEN_SIZE)
-        )
-
-        self.anchor_norm2 = nn.LayerNorm(__C.HIDDEN_SIZE)
+        self.anchor_proj = nn.Linear(__C.WREC_DIM, __C.HIDDEN_SIZE)
 
         # load ESAM model
         if __C.USE_VITS:
@@ -284,7 +269,25 @@ class Net(nn.Module):
         mean_i = torch.mean(boxes_sml[0], dim=2, keepdim=True)
         mean_i = mean_i.squeeze(2)[:, :, 4]
 
-        vals, indices = mean_i.topk(
+        batchsize, dim, h, w = s_new.size()
+
+        # [B,C,H,W] -> [B,N,C]
+        all_anchor_feat = s_new.view(batchsize, dim, h * w).permute(0, 2, 1)
+
+        # Project về cùng embedding space với sentence
+        all_anchor_feat = self.anchor_proj(all_anchor_feat)
+        lang_tokens = self.linear_ts(
+            y_['lang_feat']
+        )              # [B,L,H]
+
+        sim = torch.matmul(
+            all_anchor_feat,
+            lang_tokens.transpose(1, 2)
+        )
+        lang_score = sim.max(dim=-1).values
+        final_score = mean_i * (1 + 0.2 * lang_score)
+
+        vals, indices = final_score.topk(
             k=int(self.select_num), dim=1, largest=True, sorted=True)
         bs, gridnum, anncornum, ch = boxes_sml[0].shape
         bs_, selnum = indices.shape
@@ -304,18 +307,6 @@ class Net(nn.Module):
         x_new = self.linear_vs(i_new)
         position_embedding = self.get_position_embedding(boxes_sml_new[0])
         x_new = x_new + position_embedding
-        lang_tokens = self.linear_ts(
-            y_['lang_feat']
-        )
-        context, attn = self.anchor_cross_attn(
-            query=x_new,
-            key=lang_tokens,
-            value=lang_tokens
-        )
-        x_new = self.anchor_norm1(x_new + context)
-        ffn = self.anchor_ffn(x_new)
-        x_new = self.anchor_norm2(x_new + ffn)
-
         y_new = self.linear_ts(y_['flat_lang_feat'].unsqueeze(1))
 
         x_sup = [l_new, m_new, s_new]
