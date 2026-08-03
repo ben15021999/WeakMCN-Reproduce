@@ -266,6 +266,10 @@ class Net(nn.Module):
 
         if self.training:
             loss_det = self.head(x_new, y_new)
+
+            # --- BỔ SUNG VISION-LANGUAGE LOSS ---
+            loss_vl = self.compute_vl_contrastive_loss(x_new, y_new)
+
             predictions_s = self.head.getPrediction(x_new, y_new)
             predictions_list = [predictions_s]
             pred_boxes = self.get_boxes(boxes_sml_new, predictions_list, self.class_num)
@@ -275,13 +279,58 @@ class Net(nn.Module):
             predict_masks = self.generate_masks(x, prompt, pts_labels, self.efficientsam)
             predict_masks = self.ensure_float32(predict_masks)
             loss_seg = self.seg_head(seg_emb, box_gt, predict_masks, pred_boxes, epoch)
-            return loss_det, loss_seg
+            return loss_det, loss_seg, loss_vl
         else:
             predictions_s = self.head(x_new, y_new)
             predictions_list = [predictions_s]
             box_pred = self.get_boxes(boxes_sml_new, predictions_list, self.class_num)
             _, mask_pred = self.seg_head(seg_emb)
             return box_pred, mask_pred
+
+    def compute_vl_contrastive_loss(self, x_new, y_new, temperature=0.07):
+        """
+        Tính Image-Text Contrastive Loss (InfoNCE) giữa đặc trưng thị giác (Anchor-level)
+        và đặc trưng văn bản.
+
+        Args:
+            x_new (torch.Tensor): Visual features có shape [Batch_Size, Num_Anchors, Hidden_Dim]
+            y_new (torch.Tensor): Text features có shape [Batch_Size, 1, Hidden_Dim]
+            temperature (float): Tham số nhiệt độ scale cosine similarity (mặc định 0.07)
+
+        Returns:
+            torch.Tensor: Scalar loss value
+        """
+        # 1. Gom các anchor visual đại diện cho mỗi ảnh (Global Average Pooling qua các anchors)
+        # x_new: [B, N, C] -> x_global: [B, C]
+        x_global = x_new.mean(dim=1)
+
+        # 2. Chuẩn hóa shape của text feature
+        # y_new: [B, 1, C] -> y_global: [B, C]
+        y_global = y_new.squeeze(1)
+
+        # 3. Normalization L2 để tính Cosine Similarity chuẩn
+        x_global = F.normalize(x_global, p=2, dim=-1)
+        y_global = F.normalize(y_global, p=2, dim=-1)
+
+        # 4. Tính ma trận độ tương đồng (Similarity Matrix) giữa các mẫu trong Batch
+        # sim_matrix: [B, B] trong đó sim_matrix[i, j] là độ tương đồng giữa Image i và Text j
+        sim_matrix = torch.matmul(x_global, y_global.T) / temperature
+
+        # 5. Tạo nhãn đường chéo (Image i khớp với Text i)
+        batch_size = x_global.size(0)
+        labels = torch.arange(batch_size, device=x_new.device)
+
+        # 6. Tính Cross-Entropy Loss theo cả 2 chiều
+        # Direction 1: Image-to-Text (Mỗi ảnh chọn đúng câu text đại diện)
+        loss_i2t = F.cross_entropy(sim_matrix, labels)
+
+        # Direction 2: Text-to-Image (Mỗi câu text chọn đúng ảnh đại diện)
+        loss_t2i = F.cross_entropy(sim_matrix.T, labels)
+
+        # 7. Lấy trung bình cộng 2 chiều
+        loss_vl = (loss_i2t + loss_t2i) / 2.0
+
+        return loss_vl
 
 
     def ensure_float32(self, tensor):
