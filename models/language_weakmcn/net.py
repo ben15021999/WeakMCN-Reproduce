@@ -1,4 +1,3 @@
-# coding=utf-8
 import torch
 import torch.nn as nn
 from models.language_encoder import language_encoder
@@ -268,26 +267,7 @@ class Net(nn.Module):
         boxes_sml_new = []
         mean_i = torch.mean(boxes_sml[0], dim=2, keepdim=True)
         mean_i = mean_i.squeeze(2)[:, :, 4]
-
-        batchsize, dim, h, w = s_new.size()
-
-        # [B,C,H,W] -> [B,N,C]
-        all_anchor_feat = s_new.view(batchsize, dim, h * w).permute(0, 2, 1)
-
-        # Project về cùng embedding space với sentence
-        all_anchor_feat = self.anchor_proj(all_anchor_feat)
-        lang_tokens = self.linear_ts(
-            y_['lang_feat']
-        )              # [B,L,H]
-
-        sim = torch.matmul(
-            all_anchor_feat,
-            lang_tokens.transpose(1, 2)
-        )
-        lang_score = sim.max(dim=-1).values
-        final_score = mean_i * (1 + 0.2 * lang_score)
-
-        vals, indices = final_score.topk(
+        vals, indices = mean_i.topk(
             k=int(self.select_num), dim=1, largest=True, sorted=True)
         bs, gridnum, anncornum, ch = boxes_sml[0].shape
         bs_, selnum = indices.shape
@@ -304,9 +284,9 @@ class Net(nn.Module):
             bool().unsqueeze(2).expand(bs, gridnum, ch)).contiguous().view(bs, selnum, ch)
 
         # Anchor-based Contrastive Learning
-        x_new = self.linear_vs(i_new)
+        x_raw = self.linear_vs(i_new)
         position_embedding = self.get_position_embedding(boxes_sml_new[0])
-        x_new = x_new + position_embedding
+        x_new = x_raw + position_embedding
         y_new = self.linear_ts(y_['flat_lang_feat'].unsqueeze(1))
 
         x_sup = [l_new, m_new, s_new]
@@ -318,6 +298,7 @@ class Net(nn.Module):
         if self.training:
             loss_det = self.head(x_new, y_new)
             predictions_s = self.head.getPrediction(x_new, y_new)
+            loss_vl = self.compute_vl_contrastive_loss(x_raw, y_new)
             predictions_list = [predictions_s]
             pred_boxes = self.get_boxes(
                 boxes_sml_new, predictions_list, self.class_num)
@@ -330,7 +311,7 @@ class Net(nn.Module):
             predict_masks = self.ensure_float32(predict_masks)
             loss_seg = self.seg_head(
                 seg_emb, box_gt, predict_masks, pred_boxes, epoch)
-            return loss_det, loss_seg
+            return loss_det, loss_seg, loss_vl
         else:
             predictions_s = self.head(x_new, y_new)
             predictions_list = [predictions_s]
@@ -338,6 +319,35 @@ class Net(nn.Module):
                 boxes_sml_new, predictions_list, self.class_num)
             _, mask_pred = self.seg_head(seg_emb)
             return box_pred, mask_pred
+
+    def compute_vl_contrastive_loss(self, x_new, y_new, temperature=0.07, use_attn_pool=True):
+        # x_new lúc này CHƯA cộng position_embedding nhé, dùng i_new sau linear_vs
+        B, N, C = x_new.shape
+        y_global = y_new.squeeze(1)  # [B, C]
+
+        x_norm = F.normalize(x_new, dim=-1)
+        y_norm = F.normalize(y_global, dim=-1)
+
+        if use_attn_pool:
+            # tính trọng số cho từng anchor: anchor nào giống text nhất thì weight cao
+            # sim_per_anchor: [B, N]
+            sim_per_anchor = torch.bmm(
+                x_norm, y_norm.unsqueeze(-1)).squeeze(-1) / temperature
+            attn = F.softmax(sim_per_anchor, dim=1)  # [B, N]
+            x_global = torch.bmm(attn.unsqueeze(1), x_new).squeeze(
+                1)  # [B, C] weighted sum
+        else:
+            # lấy anchor tốt nhất, đừng mean
+            x_global = x_new.max(dim=1).values
+
+        x_global = F.normalize(x_global, dim=-1)
+
+        sim_matrix = torch.matmul(x_global, y_norm.T) / temperature
+        labels = torch.arange(B, device=x_new.device)
+
+        loss_i2t = F.cross_entropy(sim_matrix, labels)
+        loss_t2i = F.cross_entropy(sim_matrix.T, labels)
+        return (loss_i2t + loss_t2i) / 2
 
     def ensure_float32(self, tensor):
         """

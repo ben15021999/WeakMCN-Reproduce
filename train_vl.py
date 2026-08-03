@@ -102,20 +102,20 @@ def train_one_epoch(__C,
                 loss_det, loss_mask, loss_vl = net(image_iter, ref_iter, __C.USING_CHECKPOINT, box_gt=box_iter,
                                           mask_gt=mask_iter)
                 if epoch >= __C.WARM_EPOCH:
-                    loss = loss_det + loss_mask + 0.2 * loss_vl
+                    loss = loss_det + loss_mask + 0.1 * loss_vl
                 else:
-                    loss = loss_det + 0.2 * loss_vl
+                    loss = loss_det + 0.1 * loss_vl
         else:
             # loss = net(image_iter, ref_iter, gt_box_iter, info_iter)
             loss_det, loss_mask, loss_vl = net(
                 image_iter, ref_iter, box_gt=box_iter, mask_gt=mask_iter, info_iter=info_iter, epoch=epoch)
             if loss_mask is not None:
                 if epoch >= __C.WARM_EPOCH:
-                    loss = loss_det + loss_mask + 0.2 * loss_vl
+                    loss = loss_det + loss_mask + 0.1 * loss_vl
                 else:
-                    loss = loss_det + 0.2 * loss_vl
+                    loss = loss_det + 0.1 * loss_vl
             else:
-                loss = loss_det + 0.2 * loss_vl
+                loss = loss_det + 0.1 * loss_vl
 
         import gc
         gc.collect()

@@ -244,7 +244,6 @@ class Net(nn.Module):
                 3).expand(bs, gridnum, anncornum, ch)).contiguous().view(bs, selnum, anncornum, ch)
         boxes_sml_new.append(box_sml_new)
         
-        # chỗ này gắn cái SAM2 vô để refine lại cái bbox
         batchsize, dim, h, w = x_[0].size()
         i_new = x_[0].view(batchsize, dim, h * w).permute(0, 2, 1)
         bs, gridnum, ch = i_new.shape
@@ -253,9 +252,9 @@ class Net(nn.Module):
             bool().unsqueeze(2).expand(bs, gridnum, ch)).contiguous().view(bs, selnum, ch)
 
         # Anchor-based Contrastive Learning
-        x_new = self.linear_vs(i_new)
+        x_raw = self.linear_vs(i_new)
         position_embedding = self.get_position_embedding(boxes_sml_new[0])
-        x_new = x_new + position_embedding
+        x_new = x_raw + position_embedding
         y_new = self.linear_ts(y_['flat_lang_feat'].unsqueeze(1))
 
         x_sup = [l_new, m_new, s_new]
@@ -268,7 +267,7 @@ class Net(nn.Module):
             loss_det = self.head(x_new, y_new)
 
             # --- BỔ SUNG VISION-LANGUAGE LOSS ---
-            loss_vl = self.compute_vl_contrastive_loss(x_new, y_new)
+            loss_vl = self.compute_vl_contrastive_loss(x_raw, y_new)
 
             predictions_s = self.head.getPrediction(x_new, y_new)
             predictions_list = [predictions_s]
@@ -288,49 +287,30 @@ class Net(nn.Module):
             return box_pred, mask_pred
 
     def compute_vl_contrastive_loss(self, x_new, y_new, temperature=0.07):
-        """
-        Tính Image-Text Contrastive Loss (InfoNCE) giữa đặc trưng thị giác (Anchor-level)
-        và đặc trưng văn bản.
-
-        Args:
-            x_new (torch.Tensor): Visual features có shape [Batch_Size, Num_Anchors, Hidden_Dim]
-            y_new (torch.Tensor): Text features có shape [Batch_Size, 1, Hidden_Dim]
-            temperature (float): Tham số nhiệt độ scale cosine similarity (mặc định 0.07)
-
-        Returns:
-            torch.Tensor: Scalar loss value
-        """
-        # 1. Gom các anchor visual đại diện cho mỗi ảnh (Global Average Pooling qua các anchors)
-        # x_new: [B, N, C] -> x_global: [B, C]
-        x_global = x_new.mean(dim=1)
-
-        # 2. Chuẩn hóa shape của text feature
+        # x_new: [B, N, C] - Đặc trưng của N anchors
         # y_new: [B, 1, C] -> y_global: [B, C]
+        B, N, C = x_new.shape
         y_global = y_new.squeeze(1)
 
-        # 3. Normalization L2 để tính Cosine Similarity chuẩn
-        x_global = F.normalize(x_global, p=2, dim=-1)
-        y_global = F.normalize(y_global, p=2, dim=-1)
+        # 1. Chuẩn hóa L2
+        x_norm = F.normalize(x_new, dim=-1)   # [B, N, C]
+        y_norm = F.normalize(y_global, dim=-1)  # [B, C]
 
-        # 4. Tính ma trận độ tương đồng (Similarity Matrix) giữa các mẫu trong Batch
-        # sim_matrix: [B, B] trong đó sim_matrix[i, j] là độ tương đồng giữa Image i và Text j
-        sim_matrix = torch.matmul(x_global, y_global.T) / temperature
+        # 2. Tính Cosine Similarity giữa MỌI Anchor của MỌI Ảnh với MỌI Text trong Batch
+        # sim_all_anchors[i, k, j] = độ tương đồng giữa Anchor k của Ảnh i với Text j
+        # Shape: [B, N, B]
+        sim_all_anchors = torch.einsum('bnc,mc->bnm', x_norm, y_norm) / temperature
 
-        # 5. Tạo nhãn đường chéo (Image i khớp với Text i)
-        batch_size = x_global.size(0)
-        labels = torch.arange(batch_size, device=x_new.device)
+        # 3. Với mỗi cặp (Image i, Text j), chọn Anchor có điểm cao nhất
+        # sim_matrix: [B, B]
+        sim_matrix, _ = sim_all_anchors.max(dim=1)
 
-        # 6. Tính Cross-Entropy Loss theo cả 2 chiều
-        # Direction 1: Image-to-Text (Mỗi ảnh chọn đúng câu text đại diện)
+        # 4. Tính InfoNCE Cross Entropy như bình thường
+        labels = torch.arange(B, device=x_new.device)
         loss_i2t = F.cross_entropy(sim_matrix, labels)
-
-        # Direction 2: Text-to-Image (Mỗi câu text chọn đúng ảnh đại diện)
         loss_t2i = F.cross_entropy(sim_matrix.T, labels)
 
-        # 7. Lấy trung bình cộng 2 chiều
-        loss_vl = (loss_i2t + loss_t2i) / 2.0
-
-        return loss_vl
+        return (loss_i2t + loss_t2i) / 2.0
 
 
     def ensure_float32(self, tensor):
