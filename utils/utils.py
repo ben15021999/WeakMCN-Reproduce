@@ -55,7 +55,7 @@ class EMA(object):
         for name in self.buffer_keys:
             if "efficientsam" in name:
                 continue
-            if "text_encoder" in name:
+            if "clip" in name:
                 continue
             if self.buffer_ema:
                 self.shadow[name].copy_(

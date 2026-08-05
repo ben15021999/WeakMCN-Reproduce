@@ -1,4 +1,3 @@
-# coding=utf-8
 import torch
 import torch.nn as nn
 from models.language_encoder import language_encoder
@@ -107,12 +106,11 @@ class Net(nn.Module):
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
         self.pixel_std = torch.tensor(__C.STD).view(-1, 1, 1)
 
-
         # mean/std của CLIP
         self.clip_mean = torch.tensor(
-            [0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1)
+            [0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
         self.clip_std = torch.tensor(
-            [0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1)
+            [0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
         self.pos_encoder = PositionEmbeddingSine()
 
         if __C.VIS_FREEZE:
@@ -228,12 +226,13 @@ class Net(nn.Module):
             # PATCH32 NÊN DÙNG 336 THAY VÌ 224 ĐỂ ĐỠ MÙ
             # 336 / 32 = 10.5 -> HF sẽ interpolate thành 10x10, đẹp hơn 7x7
             x_clip_input = F.interpolate(x_unnorm, size=(
-                336, 336), mode='bilinear', align_corners=False)
-            x_clip_input = (x_clip_input - self.clip_mean.to(x.device)
-                            [:, None, None]) / self.clip_std.to(x.device)[:, None, None]
+                224, 224), mode='bilinear', align_corners=False)
+            x_clip_input = (
+                x_clip_input - self.clip_mean.to(x.device)) / self.clip_std.to(x.device)
 
             # [B, 50, 768] với 224 là 50, 336 là 101
-            clip_out = self.clip_model(pixel_values=x_clip_input).last_hidden_state
+            clip_out = self.clip_model(
+                pixel_values=x_clip_input).last_hidden_state
             clip_patch = clip_out[:, 1:, :]  # bỏ CLS
             B, N, C = clip_patch.shape
             h = w = int(N**0.5)  # 7 với 224, 10 với 336
@@ -273,7 +272,6 @@ class Net(nn.Module):
         sam_feature_res = sam_feature_res.permute(0, 3, 1, 2)
         sam_feature_res = F.interpolate(sam_feature_res, size=(
             52, 52), mode='bilinear', align_corners=False)
-
 
         # Project rồi mới upsample
         clip_rec = F.interpolate(clip_patch, size=(
