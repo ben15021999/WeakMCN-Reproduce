@@ -1,3 +1,4 @@
+# coding=utf-8
 import torch
 import torch.nn as nn
 from models.language_encoder import language_encoder
@@ -9,133 +10,7 @@ from EfficientSAM.efficient_sam.build_efficient_sam import build_efficient_sam_v
 from utils.utils import clip_boxes_to_image
 import math
 import torch.nn.functional as F
-from transformers import Dinov2Model
-
-
-# class LanguageGuidedAnchorSelector(nn.Module):
-#     def __init__(self, visual_dim=512, text_dim=512, hidden_dim=256, alpha=0.2):
-#         super().__init__()
-#         self.v_proj = nn.Linear(visual_dim, hidden_dim)
-#         self.t_proj = nn.Linear(text_dim, hidden_dim)
-#         self.alpha = alpha
-
-#     def forward(self, boxes_sml, feature_map, flat_lang_feat, select_num, epoch=None):
-#         bs, gridnum, anncornum, ch = boxes_sml[0].shape
-#         device = boxes_sml[0].device
-
-#         # 1. Objectness score từ YOLOv3 (Khoảng [0, 1])
-#         yolo_score = torch.mean(boxes_sml[0], dim=2)[:, :, 4]
-#         yolo_score = torch.sigmoid(yolo_score)
-
-#         # 2. Reshape visual feature đồng bộ theo spatial grid (B, H*W, C)
-#         B, C, H, W = feature_map.shape
-#         v_feat = feature_map.view(B, C, H * W).permute(0, 2, 1)
-
-#         assert gridnum == H * W, f"Gridnum ({gridnum}) mismatch with Feature Map Spatial Size ({H*W})"
-
-#         # 3. Tính điểm tương quan KHÔNG NORMALIZE
-        
-#         # Linear projection giữ nguyên magnitude
-#         v_emb = self.v_proj(v_feat)                   # Shape: [B, H*W, hidden_dim]
-#         t_emb = self.t_proj(flat_lang_feat)           # Shape: [B, hidden_dim]
-
-#         # Raw Dot Product (Tích vô hướng trực tiếp)
-#         raw_dot_product = torch.bmm(v_emb, t_emb.unsqueeze(2)).squeeze(2)  # Shape: [B, H*W]
-
-#         # Dùng Sigmoid nén giá trị dot product về khoảng [0, 1]
-#         text_sim_score = torch.sigmoid(raw_dot_product)
-
-#         # Trộn điểm theo phép nhân để bảo đảm Objectness của YOLO
-#         final_score = yolo_score * (1.0 + self.alpha * text_sim_score)
-
-#         # 4. Top-K Selection
-#         vals, indices = final_score.topk(k=int(select_num), dim=1, largest=True, sorted=True)
-
-#         # 5. Gather Anchors và Visual Feature Map theo indices
-#         box_sml_new = boxes_sml[0].masked_select(
-#             torch.zeros(bs, gridnum, device=boxes_sml[0].device)
-#             .scatter(1, indices, 1).bool()
-#             .unsqueeze(2).unsqueeze(3)
-#             .expand(bs, gridnum, anncornum, ch)
-#         ).contiguous().view(bs, select_num, anncornum, ch)
-
-#         # Cần v_feat để gather feature
-#         if 'v_feat' not in locals():
-#             B, C, H, W = feature_map.shape
-#             v_feat = feature_map.view(B, C, H * W).permute(0, 2, 1)
-
-#         i_new = v_feat.masked_select(
-#             torch.zeros(bs, gridnum, device=v_feat.device)
-#             .scatter(1, indices, 1).bool()
-#             .unsqueeze(2)
-#             .expand(bs, gridnum, C)
-#         ).contiguous().view(bs, select_num, C)
-
-#         return box_sml_new, i_new, indices
-
-class LanguageGuidedAnchorSelector(nn.Module):
-    def __init__(self, visual_dim=512, text_dim=512, hidden_dim=256, alpha=0.2):
-        super().__init__()
-        self.v_proj = nn.Linear(visual_dim, hidden_dim)
-        self.t_proj = nn.Linear(text_dim, hidden_dim)
-        self.alpha = alpha
-
-        # Khoong khoi tao zeros cho weight va bias de tuong tac ngon ngu - thi giac hoat dong tu dau
-        nn.init.xavier_uniform_(self.v_proj.weight)
-        nn.init.xavier_uniform_(self.t_proj.weight)
-
-    def forward(self, boxes_sml, feature_map, flat_lang_feat, select_num, epoch=None):
-        """
-        Args:
-            boxes_sml: List chua Tensor (BS, GridNum, AnnCorNum, Ch)
-            feature_map: Tensor (BS, C, H, W) - Feature map visual (x_[0] / s_new)
-            flat_lang_feat: Tensor (BS, Text_Dim) - Text embedding
-            select_num: int - So luong Anchor can chon (Top-K)
-            epoch: int (Optional) - Dung de Warm-up
-        """
-        bs, gridnum, anncornum, ch = boxes_sml[0].shape
-        B, C, H, W = feature_map.shape
-
-        assert gridnum == H * \
-            W, f"Gridnum ({gridnum}) không khớp với Spatial Size ({H*W})"
-
-        # 1. FIX SPATIAL ALIGNMENT: Giữ đúng vị trí tọa độ ô Grid (B, H*W, C)
-        v_feat = feature_map.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
-
-        # 2. Objectness Score từ YOLOv3
-        yolo_score = torch.mean(boxes_sml[0], dim=2)[:, :, 4]
-        yolo_score = torch.sigmoid(yolo_score)
-
-        # 3. Tính Language-Guided Score
-        v_emb = self.v_proj(v_feat)                 # [B, H*W, hidden_dim]
-        t_emb = self.t_proj(flat_lang_feat)         # [B, hidden_dim]
-
-        # Raw Dot Product
-        raw_dot_product = torch.bmm(
-            v_emb, t_emb.unsqueeze(2)).squeeze(2)  # [B, H*W]
-
-        # Scale theo root(d)
-        scale = (v_emb.shape[-1]) ** 0.5
-        text_sim_score = torch.sigmoid(raw_dot_product / scale)
-
-        # Kết hợp tuyến tính giữ vững Objectness của YOLO
-        final_score = (1.0 - self.alpha) * yolo_score + \
-            self.alpha * (yolo_score * text_sim_score)
-
-        # 4. Top-K Selection
-        vals, indices = final_score.topk(
-            k=int(select_num), dim=1, largest=True, sorted=True)
-
-        # 5. FIX GATHER LOGIC: Dùng torch.gather để GIỮ ĐÚNG THỨ TỰ UƯ TIÊN Top-1, Top-2...
-        indices_box = indices.unsqueeze(-1).unsqueeze(-1).expand(bs,
-                                                                 int(select_num), anncornum, ch)
-        box_sml_new = torch.gather(boxes_sml[0], dim=1, index=indices_box)
-
-        indices_feat = indices.unsqueeze(-1).expand(bs, int(select_num), C)
-        i_new = torch.gather(v_feat, dim=1, index=indices_feat)
-
-        # Đưa box_sml_new về dạng List[Tensor] để đồng bộ cấu trúc cũ
-        return [box_sml_new], i_new, indices
+from transformers import Dinov2Model, CLIPVisionModel
 
 
 class PositionEmbeddingSine(nn.Module):
@@ -219,27 +94,32 @@ class Net(nn.Module):
         self.linear_dino_rec = nn.Linear(768, __C.WREC_DIM)
         self.linear_dino_res = nn.Linear(768, __C.WREC_DIM)
 
-        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
-        self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
+        # load CLIP model
+        self.clip_model = CLIPVisionModel.from_pretrained(
+            "openai/clip-vit-base-patch32")
+        self.linear_clip_rec = nn.Linear(768, __C.WREC_DIM)
+        self.linear_clip_res = nn.Linear(768, __C.WREC_DIM)
+
+        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 3)
+        self.linear_router_res = nn.Linear(__C.WREC_DIM, 3)
 
         self.class_num = __C.CLASS_NUM
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
         self.pixel_std = torch.tensor(__C.STD).view(-1, 1, 1)
-        self.pos_encoder = PositionEmbeddingSine()
-        self.anchor_selector = LanguageGuidedAnchorSelector(
-            visual_dim=__C.WREC_DIM,  # Channel của s_new (WREC_DIM)
-            text_dim=__C.HIDDEN_SIZE,
-            hidden_dim=256
-        )
 
-        # Nếu muốn đổi chiều feature của y thành HIDDEN_SIZE trước khi đưa vào Cross-Attn
-        # Điều chỉnh 512 theo dim thực tế của lang_feat
-        self.linear_lang_proj = nn.Linear(512, __C.HIDDEN_SIZE)
+
+        # mean/std của CLIP
+        self.clip_mean = torch.tensor(
+            [0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1)
+        self.clip_std = torch.tensor(
+            [0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1)
+        self.pos_encoder = PositionEmbeddingSine()
 
         if __C.VIS_FREEZE:
             self.frozen(self.visual_encoder)
             self.frozen(self.efficientsam)
             self.frozen(self.dino_model)
+            self.frozen(self.clip_model)
 
     def frozen(self, module):
         if getattr(module, 'module', False):
@@ -344,6 +224,21 @@ class Net(nn.Module):
             sam_feature = self.efficientsam.get_image_embeddings(
                 resized_image_feature_sam).to(x.device)
 
+            x_unnorm = self.reverse_normalization(x)
+            # PATCH32 NÊN DÙNG 336 THAY VÌ 224 ĐỂ ĐỠ MÙ
+            # 336 / 32 = 10.5 -> HF sẽ interpolate thành 10x10, đẹp hơn 7x7
+            x_clip_input = F.interpolate(x_unnorm, size=(
+                336, 336), mode='bilinear', align_corners=False)
+            x_clip_input = (x_clip_input - self.clip_mean.to(x.device)
+                            [:, None, None]) / self.clip_std.to(x.device)[:, None, None]
+
+            # [B, 50, 768] với 224 là 50, 336 là 101
+            clip_out = self.clip_model(pixel_values=x_clip_input).last_hidden_state
+            clip_patch = clip_out[:, 1:, :]  # bỏ CLS
+            B, N, C = clip_patch.shape
+            h = w = int(N**0.5)  # 7 với 224, 10 với 336
+            clip_patch = clip_patch.transpose(1, 2).view(B, C, h, w)
+
         y_ = self.lang_encoder(y)
 
         # Vision Multi Scale Fusion
@@ -379,12 +274,25 @@ class Net(nn.Module):
         sam_feature_res = F.interpolate(sam_feature_res, size=(
             52, 52), mode='bilinear', align_corners=False)
 
+
+        # Project rồi mới upsample
+        clip_rec = F.interpolate(clip_patch, size=(
+            13, 13), mode='bilinear', align_corners=False)
+        clip_res = F.interpolate(clip_patch, size=(
+            52, 52), mode='bilinear', align_corners=False)
+
+        clip_rec = self.linear_clip_rec(
+            clip_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        clip_res = self.linear_clip_res(
+            clip_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
         # Calculate the probability distribution of router_logits
         router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
         router_logits = torch.softmax(router_logits, dim=-1)
         s_new = s_new + dino_feature_rec * \
             router_logits[:, 0][:, None, None, None] + \
-            sam_feature_rec * router_logits[:, 1][:, None, None, None]
+            sam_feature_rec * router_logits[:, 1][:, None, None, None] + \
+            clip_rec * router_logits[:, 2][:, None, None, None]
         # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
 
         # Calculate the probability distribution of router_logits
@@ -392,38 +300,30 @@ class Net(nn.Module):
         router_logits = torch.softmax(router_logits, dim=-1)
         l_new = l_new + dino_feature_res * \
             router_logits[:, 0][:, None, None, None] + \
-            sam_feature_res * router_logits[:, 1][:, None, None, None]
+            sam_feature_res * router_logits[:, 1][:, None, None, None] + \
+            clip_res * router_logits[:, 2][:, None, None, None]
         # l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
 
         x_ = [s_new, m_new, l_new]
         # Anchor Selection
-        # boxes_sml_new = []
-        # mean_i = torch.mean(boxes_sml[0], dim=2, keepdim=True)
-        # mean_i = mean_i.squeeze(2)[:, :, 4]
-        # vals, indices = mean_i.topk(
-        #     k=int(self.select_num), dim=1, largest=True, sorted=True)
-        # bs, gridnum, anncornum, ch = boxes_sml[0].shape
-        # bs_, selnum = indices.shape
-        # box_sml_new = boxes_sml[0].masked_select(
-        #     torch.zeros(bs, gridnum).to(boxes_sml[0].device).scatter(1, indices, 1).bool().unsqueeze(2).unsqueeze(
-        #         3).expand(bs, gridnum, anncornum, ch)).contiguous().view(bs, selnum, anncornum, ch)
-        # boxes_sml_new.append(box_sml_new)
+        boxes_sml_new = []
+        mean_i = torch.mean(boxes_sml[0], dim=2, keepdim=True)
+        mean_i = mean_i.squeeze(2)[:, :, 4]
+        vals, indices = mean_i.topk(
+            k=int(self.select_num), dim=1, largest=True, sorted=True)
+        bs, gridnum, anncornum, ch = boxes_sml[0].shape
+        bs_, selnum = indices.shape
+        box_sml_new = boxes_sml[0].masked_select(
+            torch.zeros(bs, gridnum).to(boxes_sml[0].device).scatter(1, indices, 1).bool().unsqueeze(2).unsqueeze(
+                3).expand(bs, gridnum, anncornum, ch)).contiguous().view(bs, selnum, anncornum, ch)
+        boxes_sml_new.append(box_sml_new)
 
-        # batchsize, dim, h, w = x_[0].size()
-        # i_new = x_[0].view(batchsize, dim, h * w).permute(0, 2, 1)
-        # bs, gridnum, ch = i_new.shape
-        # i_new = i_new.masked_select(
-        #     torch.zeros(bs, gridnum).to(i_new.device).scatter(1, indices, 1).
-        #     bool().unsqueeze(2).expand(bs, gridnum, ch)).contiguous().view(bs, selnum, ch)
-        # --- ANCHOR SELECTION CẢI TIẾN ---
-        boxes_sml_new, i_new, indices = self.anchor_selector(
-            boxes_sml=boxes_sml,
-            feature_map=x_[0],
-            flat_lang_feat=y_['flat_lang_feat'],
-            select_num=self.select_num,
-            epoch=epoch
-        )
-        # ---------------------------------
+        batchsize, dim, h, w = x_[0].size()
+        i_new = x_[0].view(batchsize, dim, h * w).permute(0, 2, 1)
+        bs, gridnum, ch = i_new.shape
+        i_new = i_new.masked_select(
+            torch.zeros(bs, gridnum).to(i_new.device).scatter(1, indices, 1).
+            bool().unsqueeze(2).expand(bs, gridnum, ch)).contiguous().view(bs, selnum, ch)
 
         # Anchor-based Contrastive Learning
         x_new = self.linear_vs(i_new)
