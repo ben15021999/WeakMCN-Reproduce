@@ -10,7 +10,12 @@ from EfficientSAM.efficient_sam.build_efficient_sam import build_efficient_sam_v
 from utils.utils import  clip_boxes_to_image
 import math
 import torch.nn.functional as F
-from transformers import Dinov2Model
+from transformers import Dinov2Model, SiglipModel, SiglipProcessor
+from PIL import Image
+
+siglip = SiglipModel.from_pretrained(
+    "google/siglip-base-patch16-224").cuda().eval()
+processor = SiglipProcessor.from_pretrained("google/siglip-base-patch16-224")
 
 
 class PositionEmbeddingSine(nn.Module):
@@ -181,7 +186,7 @@ class Net(nn.Module):
         position_embeddings = self.pos_encoder(scaled_bbox)
         return position_embeddings
 
-    def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None):
+    def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None, img_path=None, ref_txt=None):
         # Vision and Language Encodingå
         with torch.no_grad():
             boxes_all, x_, boxes_sml = self.visual_encoder(x)
@@ -278,7 +283,14 @@ class Net(nn.Module):
         else:
             predictions_s = self.head(x_new, y_new)
             predictions_list = [predictions_s]
-            box_pred = self.get_boxes(boxes_sml_new, predictions_list, self.class_num)
+            
+            box_pred_topk, det_scores = self.get_boxes_topk(
+                boxes_sml_new, predictions_list, self.class_num)
+            box_pred = []
+            for i in range(batchsize):
+                best_box, score = self.rerank_siglip(
+                    img_path[i], box_pred_topk[i], ref_txt[i], det_scores[i])
+                box_pred.append(best_box)
             _, mask_pred = self.seg_head(seg_emb)
             return box_pred, mask_pred
 
@@ -344,3 +356,69 @@ class Net(nn.Module):
         if self.training:
             box_new = box_new[..., :4]
         return box_new
+
+    def get_boxes_topk(self, boxes_sml, predictionslist, class_num, topk=5):
+        batchsize = predictionslist[0].size()[0]
+        pred = []
+        for i in range(len(predictionslist)):
+            mask = predictionslist[i].squeeze(1)
+            masked_pred = boxes_sml[i][mask]
+            refined_pred = masked_pred.view(batchsize, -1, class_num + 5)
+            refined_pred[:, :, 0] = refined_pred[:, :, 0] - refined_pred[:, :, 2] / 2
+            refined_pred[:, :, 1] = refined_pred[:, :, 1] - refined_pred[:, :, 3] / 2
+            refined_pred[:, :, 2] = refined_pred[:, :, 0] + refined_pred[:, :, 2]
+            refined_pred[:, :, 3] = refined_pred[:, :, 1] + refined_pred[:, :, 3]
+            pred.append(refined_pred.data)
+        boxes = torch.cat(pred, 1)
+        score = boxes[:, :, 4]
+        vals, inds = torch.topk(score, k=topk, dim=1)  # [B, 5]
+        # gather 10 boxes
+        top_boxes = torch.gather(boxes, 1, inds.unsqueeze(-1).repeat(1, 1, 5))
+        # max_score, ind = torch.max(score, -1)
+        # ind_new = ind.unsqueeze(1).unsqueeze(1).repeat(1, 1, 5)
+        # box_new = torch.gather(boxes, 1, ind_new)
+        if self.training:
+            box_new = box_new[..., :4]
+        return top_boxes, vals
+
+    @torch.no_grad()
+    def rerank_siglip(self, img_path, boxes_xyxy, raw_text, det_scores=None, alpha=0.7):
+        """
+        img_path: đường dẫn ảnh gốc
+        boxes_xyxy: [10,4] box 416x416 từ net 68.63 của bạn
+        raw_text: câu gốc
+        det_scores: [10] điểm của head, nếu không có thì dùng clip thôi
+        """
+        # đọc ảnh gốc rồi resize về 416 cho khớp hệ tọa độ box
+        pil_416 = Image.open(img_path).convert("RGB").resize((416, 416))
+
+        crops = []
+        valid_boxes = []
+        for b in boxes_xyxy:
+            x1, y1, x2, y2 = map(int, b.tolist())
+            x1, y1, x2, y2 = max(0, x1), max(0, y1), min(415, x2), min(415, y2)
+            if x2-x1 < 5 or y2-y1 < 5:
+                continue
+            crops.append(pil_416.crop((x1, y1, x2, y2)).resize((224, 224)))
+            valid_boxes.append(b)
+
+        if not crops:
+            return boxes_xyxy[0]
+
+        inputs = processor(text=[raw_text]*len(crops), images=crops,
+                        return_tensors="pt", padding=True).to("cuda")
+        out = siglip(**inputs)
+        image_embeds = out.image_embeds / \
+            out.image_embeds.norm(dim=-1, keepdim=True)
+        text_embeds = out.text_embeds / out.text_embeds.norm(dim=-1, keepdim=True)
+        clip_scores = (image_embeds @ text_embeds.T).squeeze(-1)  # [K]
+
+        if det_scores is not None:
+            # det_scores phải cắt theo valid_boxes
+            det_scores = det_scores[:len(valid_boxes)].to(clip_scores.device)
+            final_scores = alpha * clip_scores + (1-alpha) * det_scores
+        else:
+            final_scores = clip_scores
+
+        best_idx = final_scores.argmax().item()
+        return valid_boxes[best_idx], float(final_scores[best_idx])
