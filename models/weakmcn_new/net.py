@@ -99,8 +99,27 @@ class Net(nn.Module):
         self.linear_clip_rec = nn.Linear(768, __C.WREC_DIM)
         self.linear_clip_res = nn.Linear(768, __C.WREC_DIM)
 
-        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 3)
-        self.linear_router_res = nn.Linear(__C.WREC_DIM, 3)
+
+        # self.linear_router_rec = nn.Linear(__C.WREC_DIM, 3)
+        # self.linear_router_res = nn.Linear(__C.WREC_DIM, 3)
+        # Input dim = WREC_DIM (Visual) + 512 (Language Feature Dim)
+        in_dim_rec = __C.WREC_DIM + 512
+        in_dim_res = __C.WRES_DIM + 512  # Hoặc WREC_DIM tùy theo kích thước layer l_new
+
+        self.router_rec = nn.Sequential(
+            nn.Linear(in_dim_rec, __C.HIDDEN_SIZE),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            # Out: 3 trọng số tương ứng [DINO, SAM, CLIP]
+            nn.Linear(__C.HIDDEN_SIZE, 3)
+        )
+
+        self.router_res = nn.Sequential(
+            nn.Linear(in_dim_res, __C.HIDDEN_SIZE),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(__C.HIDDEN_SIZE, 3)
+        )
 
         self.class_num = __C.CLASS_NUM
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
@@ -226,13 +245,13 @@ class Net(nn.Module):
             # PATCH32 NÊN DÙNG 336 THAY VÌ 224 ĐỂ ĐỠ MÙ
             # 336 / 32 = 10.5 -> HF sẽ interpolate thành 10x10, đẹp hơn 7x7
             x_clip_input = F.interpolate(x_unnorm, size=(
-                224, 224), mode='bilinear', align_corners=False)
-            x_clip_input = (
-                x_clip_input - self.clip_mean.to(x.device)) / self.clip_std.to(x.device)
+                384, 384), mode='bilinear', align_corners=False)
+            x_clip_input = (x_clip_input - self.clip_mean.to(x.device)) / \
+                self.clip_std.to(x.device)
 
             # [B, 50, 768] với 224 là 50, 336 là 101
             clip_out = self.clip_model(
-                pixel_values=x_clip_input).last_hidden_state
+                pixel_values=x_clip_input, interpolate_pos_encoding=True).last_hidden_state
             clip_patch = clip_out[:, 1:, :]  # bỏ CLS
             B, N, C = clip_patch.shape
             h = w = int(N**0.5)  # 7 với 224, 10 với 336
@@ -273,29 +292,50 @@ class Net(nn.Module):
         sam_feature_res = F.interpolate(sam_feature_res, size=(
             52, 52), mode='bilinear', align_corners=False)
 
+        clip_rec_proj = self.linear_clip_rec(
+            clip_patch.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        clip_res_proj = self.linear_clip_res(
+            clip_patch.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
         # Project rồi mới upsample
-        clip_rec = F.interpolate(clip_patch, size=(
+        clip_rec = F.interpolate(clip_rec_proj, size=(
             13, 13), mode='bilinear', align_corners=False)
-        clip_res = F.interpolate(clip_patch, size=(
+        clip_res = F.interpolate(clip_res_proj, size=(
             52, 52), mode='bilinear', align_corners=False)
 
-        clip_rec = self.linear_clip_rec(
-            clip_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        clip_res = self.linear_clip_res(
-            clip_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-
         # Calculate the probability distribution of router_logits
-        router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
-        router_logits = torch.softmax(router_logits, dim=-1)
+        # router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
+        # router_logits = torch.softmax(router_logits, dim=-1)
+        # --- ROUTING CHO REC (DETECTION) ---
+        # 1. Trích xuất text feature toàn cục
+        text_feat = y_['flat_lang_feat']  # Tensor shape [B, 512]
+
+        # 2. Concat Visual + Text feature
+        # rec_feature: [B, WREC_DIM]
+        fusion_rec_feat = torch.cat(
+            [rec_feature, text_feat], dim=-1)  # [B, WREC_DIM + 512]
+
+        # 3. Tính toán trọng số Routing (Softmax)
+        router_logits_rec = self.router_rec(fusion_rec_feat)  # [B, 3]
+        router_logits = torch.softmax(router_logits_rec, dim=-1)   # [B, 3]
         s_new = s_new + dino_feature_rec * \
             router_logits[:, 0][:, None, None, None] + \
             sam_feature_rec * router_logits[:, 1][:, None, None, None] + \
             clip_rec * router_logits[:, 2][:, None, None, None]
         # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
 
+
         # Calculate the probability distribution of router_logits
-        router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
-        router_logits = torch.softmax(router_logits, dim=-1)
+        # router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
+        # router_logits = torch.softmax(router_logits, dim=-1)
+        # --- ROUTING CHO RES (SEGMENTATION) ---
+        # 1. Concat Visual + Text feature
+        fusion_res_feat = torch.cat(
+            [res_feature, text_feat], dim=-1)  # [B, WRES_DIM + 512]
+
+        # 2. Tính toán trọng số Routing
+        router_logits_res = self.router_res(fusion_res_feat)  # [B, 3]
+        router_logits = torch.softmax(router_logits_res, dim=-1)   # [B, 3]
         l_new = l_new + dino_feature_res * \
             router_logits[:, 0][:, None, None, None] + \
             sam_feature_res * router_logits[:, 1][:, None, None, None] + \
