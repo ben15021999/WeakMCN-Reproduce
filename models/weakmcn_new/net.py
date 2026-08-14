@@ -296,17 +296,6 @@ class Net(nn.Module):
         router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
         router_logits = torch.softmax(router_logits, dim=-1)
         # # --- ROUTING CHO REC (DETECTION) ---
-        # # 1. Trích xuất text feature toàn cục
-        # text_feat = y_['flat_lang_feat']  # Tensor shape [B, 512]
-
-        # # 2. Concat Visual + Text feature
-        # # rec_feature: [B, WREC_DIM]
-        # fusion_rec_feat = torch.cat(
-        #     [rec_feature, text_feat], dim=-1)  # [B, WREC_DIM + 512]
-
-        # # 3. Tính toán trọng số Routing (Softmax)
-        # router_logits_rec = self.router_rec(fusion_rec_feat)  # [B, 3]
-        # router_logits = torch.softmax(router_logits_rec, dim=-1)   # [B, 3]
         s_new = s_new + dino_feature_rec * \
             router_logits[:, 0][:, None, None, None] + \
             sam_feature_rec * router_logits[:, 1][:, None, None, None] + \
@@ -317,13 +306,6 @@ class Net(nn.Module):
         router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
         router_logits = torch.softmax(router_logits, dim=-1)
         # --- ROUTING CHO RES (SEGMENTATION) ---
-        # # 1. Concat Visual + Text feature
-        # fusion_res_feat = torch.cat(
-        #     [res_feature, text_feat], dim=-1)  # [B, WRES_DIM + 512]
-
-        # # 2. Tính toán trọng số Routing
-        # router_logits_res = self.router_res(fusion_res_feat)  # [B, 3]
-        # router_logits = torch.softmax(router_logits_res, dim=-1)   # [B, 3]
         l_new = l_new + dino_feature_res * \
             router_logits[:, 0][:, None, None, None] + \
             sam_feature_res * router_logits[:, 1][:, None, None, None] + \

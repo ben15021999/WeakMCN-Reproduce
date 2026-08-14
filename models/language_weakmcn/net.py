@@ -9,7 +9,7 @@ from EfficientSAM.efficient_sam.build_efficient_sam import build_efficient_sam_v
 from utils.utils import clip_boxes_to_image
 import math
 import torch.nn.functional as F
-from transformers import Dinov2Model
+from transformers import Dinov2Model, CLIPVisionModel, CLIPModel, CLIPTokenizer
 
 
 class PositionEmbeddingSine(nn.Module):
@@ -80,8 +80,6 @@ class Net(nn.Module):
         )
         self.attention_manner = GaranAttention(512, __C.WRES_DIM)
 
-        self.anchor_proj = nn.Linear(__C.WREC_DIM, __C.HIDDEN_SIZE)
-
         # load ESAM model
         if __C.USE_VITS:
             self.efficientsam = build_efficient_sam_vits()
@@ -95,18 +93,56 @@ class Net(nn.Module):
         self.linear_dino_rec = nn.Linear(768, __C.WREC_DIM)
         self.linear_dino_res = nn.Linear(768, __C.WREC_DIM)
 
-        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
-        self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
+        # load CLIP model
+        self.clip_model = CLIPModel.from_pretrained(
+            "openai/clip-vit-base-patch16")
+        
+        self.linear_clip_rec = nn.Linear(768, __C.WREC_DIM)
+        self.linear_clip_res = nn.Linear(768, __C.WREC_DIM)
+
+        # Projections để inject Heatmap vào Feature map của REC (13x13) và RES (52x52)
+        # Heatmap có 1 channel, ta project lên chiều WREC_DIM / WRES_DIM
+        self.heatmap_proj_rec = nn.Sequential(
+            nn.Conv2d(1, __C.WREC_DIM, kernel_size=1),
+            nn.Sigmoid()
+        )
+        self.heatmap_proj_res = nn.Sequential(
+            nn.Conv2d(1, __C.WRES_DIM, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 3)
+        self.linear_router_res = nn.Linear(__C.WREC_DIM, 3)
+        # Input dim = WREC_DIM (Visual) + 512 (Language Feature Dim)
+        # in_dim_rec = __C.WREC_DIM + 512
+        # in_dim_res = __C.WREC_DIM + 512  # Hoặc WREC_DIM tùy theo kích thước layer l_new
 
         self.class_num = __C.CLASS_NUM
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
         self.pixel_std = torch.tensor(__C.STD).view(-1, 1, 1)
+
+        # mean/std của CLIP
+        self.clip_mean = torch.tensor(
+            [0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
+        self.clip_std = torch.tensor(
+            [0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+        # Thường là 512
+        clip_embed_dim = self.clip_model.text_projection.weight.shape[0]
+
+        self.lang_encoder_to_clip = nn.Sequential(
+            # __C.HIDDEN_SIZE = 512
+            nn.Linear(__C.HIDDEN_SIZE, clip_embed_dim),
+            nn.LayerNorm(clip_embed_dim),
+            nn.ReLU(inplace=True)
+        )
+
         self.pos_encoder = PositionEmbeddingSine()
 
         if __C.VIS_FREEZE:
             self.frozen(self.visual_encoder)
             self.frozen(self.efficientsam)
             self.frozen(self.dino_model)
+            self.frozen(self.clip_model)
 
     def frozen(self, module):
         if getattr(module, 'module', False):
@@ -197,8 +233,38 @@ class Net(nn.Module):
         position_embeddings = self.pos_encoder(scaled_bbox)
         return position_embeddings
 
+    def generate_clip_semantic_heatmap(self, clip_patch_tokens, clip_text_embeds):
+        """
+        Args:
+            clip_patch_tokens: [B, N, 768] - Spatial patch tokens từ CLIP Vision (đã bỏ CLS)
+            clip_text_embeds:  [B, 768]    - Global Text Feature từ CLIP Text
+        Returns:
+            heatmap: [B, 1, H, W] - Heatmap không gian mang giá trị [0, 1]
+        """
+        # Normalize features về đơn vị (unit vector) để tính Cosine Similarity
+        patch_embeds_norm = F.normalize(
+            clip_patch_tokens, dim=-1)  # [B, N, 768]
+        text_embeds_norm = F.normalize(
+            clip_text_embeds, dim=-1).unsqueeze(1)  # [B, 1, 768]
+
+        # Tính Cosine Similarity giữa từng Patch và Text Query
+        # [B, N, 768] x [B, 768, 1] -> [B, N, 1]
+        sim_map = torch.bmm(patch_embeds_norm, text_embeds_norm.transpose(
+            1, 2)).squeeze(-1)  # [B, N]
+
+        # Reshape về dạng 2D Grid (Với patch16 size 384 -> N = 576 -> 24x24)
+        B, N = sim_map.shape
+        h = w = int(math.isqrt(N))
+        sim_map = sim_map.view(B, 1, h, w)  # [B, 1, 24, 24]
+
+        # Scale nhiệt độ (Temperature scaling) & ReLU/Sigmoid để làm nổi bật vùng quan trọng
+        # Giữ lại các giá trị similarity dương
+        heatmap = F.relu(sim_map)
+
+        return heatmap
+
     def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None):
-        # Vision and Language Encodingå
+        # Vision and Language Encoding
         with torch.no_grad():
             boxes_all, x_, boxes_sml = self.visual_encoder(x)
 
@@ -211,7 +277,30 @@ class Net(nn.Module):
             sam_feature = self.efficientsam.get_image_embeddings(
                 resized_image_feature_sam).to(x.device)
 
+            x_unnorm = self.reverse_normalization(x)
+            # PATCH32 NÊN DÙNG 336 THAY VÌ 224 ĐỂ ĐỠ MÙ
+            # 336 / 32 = 10.5 -> HF sẽ interpolate thành 10x10, đẹp hơn 7x7
+            x_clip_input = F.interpolate(x_unnorm, size=(
+                224, 224), mode='bilinear', align_corners=False)
+            x_clip_input = (x_clip_input - self.clip_mean.to(x.device)) / \
+                self.clip_std.to(x.device)
+
+            # [B, 50, 768] với 224 là 50, 336 là 101
+            clip_out = self.clip_model(
+                pixel_values=x_clip_input, interpolate_pos_encoding=True).last_hidden_state
+            clip_patch = clip_out[:, 1:, :]  # bỏ CLS
+
+            B, N, C = clip_patch.shape
+            h = w = int(N**0.5)  # 7 với 224, 10 với 336
+            clip_patch = clip_patch.transpose(1, 2).view(B, C, h, w)
+            clip_patch_proj = self.clip_model.visual_projection(clip_patch)
+
         y_ = self.lang_encoder(y)
+
+        with torch.no_grad():
+            # Map text feature sang CLIP space và normalize
+            text_mapped = self.lang_encoder_to_clip(y_['flat_lang_feat'])
+            clip_text_embeds = self.clip_model.text_projection(text_mapped)
 
         # Vision Multi Scale Fusion
         s, m, l = x_
@@ -219,10 +308,15 @@ class Net(nn.Module):
         l_new, m_new, s_new = self.multi_scale_manner(x_input)
 
         # Dynamic routing
-        rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(
-            0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
-        res_feature = F.adaptive_avg_pool2d(l_new, (1, 1)).permute(
-            0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
+        # rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(
+        #     0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
+        # res_feature = F.adaptive_avg_pool2d(l_new, (1, 1)).permute(
+        #     0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
+        # 1. Biến đổi rec_feature & res_feature thành dạng 2D [B, WREC_DIM]
+        rec_feature = F.adaptive_avg_pool2d(
+            s_new, (1, 1)).flatten(1)  # Shape: [B, WREC_DIM]
+        res_feature = F.adaptive_avg_pool2d(
+            l_new, (1, 1)).flatten(1)  # Shape: [B, WRES_DIM]
 
         # load dino model
         dino_feature = dino_feature[:, 1:, :]
@@ -246,20 +340,71 @@ class Net(nn.Module):
         sam_feature_res = F.interpolate(sam_feature_res, size=(
             52, 52), mode='bilinear', align_corners=False)
 
+        # 4. Tạo Semantic Heatmap [B, 1, 24, 24]
+        semantic_heatmap = self.generate_clip_semantic_heatmap(
+            clip_patch_proj, clip_text_embeds)
+
+        # 5. Reshape clip_patch để dùng cho visual features
+        B, N, C = clip_patch.shape
+        h = w = int(math.isqrt(N))  # 24
+        clip_patch_2d = clip_patch.transpose(
+            1, 2).view(B, C, h, w)  # [B, 768, 24, 24]
+
+        # 6. Linear Project như cũ
+        clip_rec_proj = self.linear_clip_rec(
+            clip_patch_2d.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        clip_res_proj = self.linear_clip_res(
+            clip_patch_2d.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+        # Interpolate về kích thước Detection (13x13) và Segmentation (52x52)
+        clip_rec = F.interpolate(clip_rec_proj, size=(
+            13, 13), mode='bilinear', align_corners=False)
+        clip_res = F.interpolate(clip_res_proj, size=(
+            52, 52), mode='bilinear', align_corners=False)
+
+        # Interpolate Heatmap về 13x13 và 52x52
+        heatmap_rec = F.interpolate(semantic_heatmap, size=(
+            13, 13), mode='bilinear', align_corners=False)
+        heatmap_res = F.interpolate(semantic_heatmap, size=(
+            52, 52), mode='bilinear', align_corners=False)
+
+        # 7. MULTIPLY HEATMAP (Thao tác cốt lõi: Tự động LỌC NHIỄU theo Semantic)
+        # Bằng cách nhân Heatmap, vùng nào KHÔNG liên quan đến câu Text Query sẽ bị nhân với ~0
+        gate_rec = self.heatmap_proj_rec(heatmap_rec)
+        gate_res = self.heatmap_proj_res(heatmap_res)
+
+        clip_rec = clip_rec * gate_rec
+        clip_res = clip_res * gate_res
+
+        # clip_rec_proj = self.linear_clip_rec(
+        #     clip_patch.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        # clip_res_proj = self.linear_clip_res(
+        #     clip_patch.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+        # # Project rồi mới upsample
+        # clip_rec = F.interpolate(clip_rec_proj, size=(
+        #     13, 13), mode='bilinear', align_corners=False)
+        # clip_res = F.interpolate(clip_res_proj, size=(
+        #     52, 52), mode='bilinear', align_corners=False)
+
         # Calculate the probability distribution of router_logits
         router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
         router_logits = torch.softmax(router_logits, dim=-1)
+        # # --- ROUTING CHO REC (DETECTION) ---
         s_new = s_new + dino_feature_rec * \
             router_logits[:, 0][:, None, None, None] + \
-            sam_feature_rec * router_logits[:, 1][:, None, None, None]
+            sam_feature_rec * router_logits[:, 1][:, None, None, None] + \
+            clip_rec * router_logits[:, 2][:, None, None, None]
         # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
 
         # Calculate the probability distribution of router_logits
         router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
         router_logits = torch.softmax(router_logits, dim=-1)
+        # --- ROUTING CHO RES (SEGMENTATION) ---
         l_new = l_new + dino_feature_res * \
             router_logits[:, 0][:, None, None, None] + \
-            sam_feature_res * router_logits[:, 1][:, None, None, None]
+            sam_feature_res * router_logits[:, 1][:, None, None, None] + \
+            clip_res * router_logits[:, 2][:, None, None, None]
         # l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
 
         x_ = [s_new, m_new, l_new]
@@ -284,9 +429,9 @@ class Net(nn.Module):
             bool().unsqueeze(2).expand(bs, gridnum, ch)).contiguous().view(bs, selnum, ch)
 
         # Anchor-based Contrastive Learning
-        x_raw = self.linear_vs(i_new)
+        x_new = self.linear_vs(i_new)
         position_embedding = self.get_position_embedding(boxes_sml_new[0])
-        x_new = x_raw + position_embedding
+        x_new = x_new + position_embedding
         y_new = self.linear_ts(y_['flat_lang_feat'].unsqueeze(1))
 
         x_sup = [l_new, m_new, s_new]
@@ -298,7 +443,6 @@ class Net(nn.Module):
         if self.training:
             loss_det = self.head(x_new, y_new)
             predictions_s = self.head.getPrediction(x_new, y_new)
-            loss_vl = self.compute_vl_contrastive_loss(x_raw, y_new)
             predictions_list = [predictions_s]
             pred_boxes = self.get_boxes(
                 boxes_sml_new, predictions_list, self.class_num)
@@ -311,7 +455,7 @@ class Net(nn.Module):
             predict_masks = self.ensure_float32(predict_masks)
             loss_seg = self.seg_head(
                 seg_emb, box_gt, predict_masks, pred_boxes, epoch)
-            return loss_det, loss_seg, loss_vl
+            return loss_det, loss_seg
         else:
             predictions_s = self.head(x_new, y_new)
             predictions_list = [predictions_s]
@@ -319,35 +463,6 @@ class Net(nn.Module):
                 boxes_sml_new, predictions_list, self.class_num)
             _, mask_pred = self.seg_head(seg_emb)
             return box_pred, mask_pred
-
-    def compute_vl_contrastive_loss(self, x_new, y_new, temperature=0.07, use_attn_pool=True):
-        # x_new lúc này CHƯA cộng position_embedding nhé, dùng i_new sau linear_vs
-        B, N, C = x_new.shape
-        y_global = y_new.squeeze(1)  # [B, C]
-
-        x_norm = F.normalize(x_new, dim=-1)
-        y_norm = F.normalize(y_global, dim=-1)
-
-        if use_attn_pool:
-            # tính trọng số cho từng anchor: anchor nào giống text nhất thì weight cao
-            # sim_per_anchor: [B, N]
-            sim_per_anchor = torch.bmm(
-                x_norm, y_norm.unsqueeze(-1)).squeeze(-1) / temperature
-            attn = F.softmax(sim_per_anchor, dim=1)  # [B, N]
-            x_global = torch.bmm(attn.unsqueeze(1), x_new).squeeze(
-                1)  # [B, C] weighted sum
-        else:
-            # lấy anchor tốt nhất, đừng mean
-            x_global = x_new.max(dim=1).values
-
-        x_global = F.normalize(x_global, dim=-1)
-
-        sim_matrix = torch.matmul(x_global, y_norm.T) / temperature
-        labels = torch.arange(B, device=x_new.device)
-
-        loss_i2t = F.cross_entropy(sim_matrix, labels)
-        loss_t2i = F.cross_entropy(sim_matrix.T, labels)
-        return (loss_i2t + loss_t2i) / 2
 
     def ensure_float32(self, tensor):
         """
