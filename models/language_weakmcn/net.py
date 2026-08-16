@@ -9,7 +9,7 @@ from EfficientSAM.efficient_sam.build_efficient_sam import build_efficient_sam_v
 from utils.utils import clip_boxes_to_image
 import math
 import torch.nn.functional as F
-from transformers import Dinov2Model, CLIPVisionModel, CLIPModel, CLIPTokenizer
+from transformers import Dinov2Model, CLIPModel, CLIPProcessor
 
 
 class PositionEmbeddingSine(nn.Module):
@@ -93,23 +93,18 @@ class Net(nn.Module):
         self.linear_dino_rec = nn.Linear(768, __C.WREC_DIM)
         self.linear_dino_res = nn.Linear(768, __C.WREC_DIM)
 
-        # load CLIP model
-        self.clip_model = CLIPModel.from_pretrained(
-            "openai/clip-vit-base-patch16")
-        
-        self.linear_clip_rec = nn.Linear(768, __C.WREC_DIM)
-        self.linear_clip_res = nn.Linear(768, __C.WREC_DIM)
 
-        # Projections để inject Heatmap vào Feature map của REC (13x13) và RES (52x52)
-        # Heatmap có 1 channel, ta project lên chiều WREC_DIM / WRES_DIM
-        self.heatmap_proj_rec = nn.Sequential(
-            nn.Conv2d(1, __C.WREC_DIM, kernel_size=1),
-            nn.Sigmoid()
-        )
-        self.heatmap_proj_res = nn.Sequential(
-            nn.Conv2d(1, __C.WRES_DIM, kernel_size=1),
-            nn.Sigmoid()
-        )
+        # load CLIP model
+        # --- THÊM ---
+        self.clip_processor = CLIPProcessor.from_pretrained(
+            "openai/clip-vit-base-patch32")
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+
+        self.linear_clip_rec = nn.Linear(512, __C.WREC_DIM)
+        self.linear_clip_res = nn.Linear(512, __C.WREC_DIM)
+
+        # Head để align anchor feature của bạn với không gian CLIP
+        self.clip_align_proj = nn.Linear(__C.HIDDEN_SIZE, 512)
 
         self.linear_router_rec = nn.Linear(__C.WREC_DIM, 3)
         self.linear_router_res = nn.Linear(__C.WREC_DIM, 3)
@@ -126,16 +121,6 @@ class Net(nn.Module):
             [0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
         self.clip_std = torch.tensor(
             [0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
-        # Thường là 512
-        clip_embed_dim = self.clip_model.text_projection.weight.shape[0]
-
-        self.lang_encoder_to_clip = nn.Sequential(
-            # __C.HIDDEN_SIZE = 512
-            nn.Linear(__C.HIDDEN_SIZE, clip_embed_dim),
-            nn.LayerNorm(clip_embed_dim),
-            nn.ReLU(inplace=True)
-        )
-
         self.pos_encoder = PositionEmbeddingSine()
 
         if __C.VIS_FREEZE:
@@ -233,38 +218,38 @@ class Net(nn.Module):
         position_embeddings = self.pos_encoder(scaled_bbox)
         return position_embeddings
 
-    def generate_clip_semantic_heatmap(self, clip_patch_tokens, clip_text_embeds):
-        """
-        Args:
-            clip_patch_tokens: [B, N, 768] - Spatial patch tokens từ CLIP Vision (đã bỏ CLS)
-            clip_text_embeds:  [B, 768]    - Global Text Feature từ CLIP Text
-        Returns:
-            heatmap: [B, 1, H, W] - Heatmap không gian mang giá trị [0, 1]
-        """
-        # Normalize features về đơn vị (unit vector) để tính Cosine Similarity
-        patch_embeds_norm = F.normalize(
-            clip_patch_tokens, dim=-1)  # [B, N, 768]
-        text_embeds_norm = F.normalize(
-            clip_text_embeds, dim=-1).unsqueeze(1)  # [B, 1, 768]
+    def get_clip_features(self, images_unnorm, raw_texts):
+        # images_unnorm: [B,3,H,W] đã reverse_normalization, range [0,1]
+        # raw_texts: list string, ví dụ ["the man in red shirt", ...]
+        inputs = self.clip_processor(text=raw_texts, images=images_unnorm,
+                                    return_tensors="pt", padding=True, truncation=True)
+        inputs = {k: v.to(images_unnorm.device) for k, v in inputs.items() if k in [
+            'iput_ids', 'attention_mask', 'pixel_values']}
 
-        # Tính Cosine Similarity giữa từng Patch và Text Query
-        # [B, N, 768] x [B, 768, 1] -> [B, N, 1]
-        sim_map = torch.bmm(patch_embeds_norm, text_embeds_norm.transpose(
-            1, 2)).squeeze(-1)  # [B, N]
+        with torch.no_grad():  # CLIP frozen làm teacher
+            text_emb = self.clip_model.get_text_features(input_ids=inputs['input_ids'],
+                                                        attention_mask=inputs['attention_mask'])
+            image_emb = self.clip_model.get_image_features(
+                pixel_values=inputs['pixel_values'])
 
-        # Reshape về dạng 2D Grid (Với patch16 size 384 -> N = 576 -> 24x24)
-        B, N = sim_map.shape
-        h = w = int(math.isqrt(N))
-        sim_map = sim_map.view(B, 1, h, w)  # [B, 1, 24, 24]
+        text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
+        image_emb = image_emb / image_emb.norm(dim=-1, keepdim=True)
+        return image_emb, text_emb  # [B,512]
 
-        # Scale nhiệt độ (Temperature scaling) & ReLU/Sigmoid để làm nổi bật vùng quan trọng
-        # Giữ lại các giá trị similarity dương
-        heatmap = F.relu(sim_map)
 
-        return heatmap
+    def get_region_clip_loss(self, x_new, text_emb_clip):
+        # x_new: [B, sel_num, HIDDEN] là anchor feature sau khi + position embedding
+        # Dùng anchor được chọn có score cao nhất để align với text
+        v_proj = self.clip_align_proj(x_new)  # [B, sel_num, 512]
+        v_proj = v_proj / v_proj.norm(dim=-1, keepdim=True)
+        # lấy max similarity trong sel_num anchors
+        sim = (v_proj @ text_emb_clip.unsqueeze(-1)).squeeze(-1)  # [B, sel_num]
+        max_sim, _ = sim.max(dim=1)
+        loss_clip = (1 - max_sim).mean()  # InfoNCE đơn giản
+        return loss_clip
 
-    def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None):
-        # Vision and Language Encoding
+    def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None, raw_texts=None):
+        # Vision and Language Encodingå
         with torch.no_grad():
             boxes_all, x_, boxes_sml = self.visual_encoder(x)
 
@@ -285,22 +270,10 @@ class Net(nn.Module):
             x_clip_input = (x_clip_input - self.clip_mean.to(x.device)) / \
                 self.clip_std.to(x.device)
 
-            # [B, 50, 768] với 224 là 50, 336 là 101
-            clip_out = self.clip_model(
-                pixel_values=x_clip_input, interpolate_pos_encoding=True).last_hidden_state
-            clip_patch = clip_out[:, 1:, :]  # bỏ CLS
-
-            B, N, C = clip_patch.shape
-            h = w = int(N**0.5)  # 7 với 224, 10 với 336
-            clip_patch = clip_patch.transpose(1, 2).view(B, C, h, w)
-            clip_patch_proj = self.clip_model.visual_projection(clip_patch)
+            clip_img_emb, clip_txt_emb = self.get_clip_features(
+                x_unnorm, raw_texts)
 
         y_ = self.lang_encoder(y)
-
-        with torch.no_grad():
-            # Map text feature sang CLIP space và normalize
-            text_mapped = self.lang_encoder_to_clip(y_['flat_lang_feat'])
-            clip_text_embeds = self.clip_model.text_projection(text_mapped)
 
         # Vision Multi Scale Fusion
         s, m, l = x_
@@ -340,52 +313,14 @@ class Net(nn.Module):
         sam_feature_res = F.interpolate(sam_feature_res, size=(
             52, 52), mode='bilinear', align_corners=False)
 
-        # 4. Tạo Semantic Heatmap [B, 1, 24, 24]
-        semantic_heatmap = self.generate_clip_semantic_heatmap(
-            clip_patch_proj, clip_text_embeds)
 
-        # 5. Reshape clip_patch để dùng cho visual features
-        B, N, C = clip_patch.shape
-        h = w = int(math.isqrt(N))  # 24
-        clip_patch_2d = clip_patch.transpose(
-            1, 2).view(B, C, h, w)  # [B, 768, 24, 24]
-
-        # 6. Linear Project như cũ
-        clip_rec_proj = self.linear_clip_rec(
-            clip_patch_2d.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        clip_res_proj = self.linear_clip_res(
-            clip_patch_2d.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-
-        # Interpolate về kích thước Detection (13x13) và Segmentation (52x52)
-        clip_rec = F.interpolate(clip_rec_proj, size=(
-            13, 13), mode='bilinear', align_corners=False)
-        clip_res = F.interpolate(clip_res_proj, size=(
-            52, 52), mode='bilinear', align_corners=False)
-
-        # Interpolate Heatmap về 13x13 và 52x52
-        heatmap_rec = F.interpolate(semantic_heatmap, size=(
-            13, 13), mode='bilinear', align_corners=False)
-        heatmap_res = F.interpolate(semantic_heatmap, size=(
-            52, 52), mode='bilinear', align_corners=False)
-
-        # 7. MULTIPLY HEATMAP (Thao tác cốt lõi: Tự động LỌC NHIỄU theo Semantic)
-        # Bằng cách nhân Heatmap, vùng nào KHÔNG liên quan đến câu Text Query sẽ bị nhân với ~0
-        gate_rec = self.heatmap_proj_rec(heatmap_rec)
-        gate_res = self.heatmap_proj_res(heatmap_res)
-
-        clip_rec = clip_rec * gate_rec
-        clip_res = clip_res * gate_res
-
-        # clip_rec_proj = self.linear_clip_rec(
-        #     clip_patch.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        # clip_res_proj = self.linear_clip_res(
-        #     clip_patch.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-
-        # # Project rồi mới upsample
-        # clip_rec = F.interpolate(clip_rec_proj, size=(
-        #     13, 13), mode='bilinear', align_corners=False)
-        # clip_res = F.interpolate(clip_res_proj, size=(
-        #     52, 52), mode='bilinear', align_corners=False)
+        # Project clip
+        clip_feat_map_rec = clip_img_emb[:, :, None, None].expand(-1, -1, 13, 13)
+        clip_feat_map_rec = self.linear_clip_rec(
+            clip_feat_map_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        clip_feat_map_res = clip_img_emb[:, :, None, None].expand(-1, -1, 52, 52)
+        clip_feat_map_res = self.linear_clip_res(
+            clip_feat_map_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         # Calculate the probability distribution of router_logits
         router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
@@ -394,7 +329,7 @@ class Net(nn.Module):
         s_new = s_new + dino_feature_rec * \
             router_logits[:, 0][:, None, None, None] + \
             sam_feature_rec * router_logits[:, 1][:, None, None, None] + \
-            clip_rec * router_logits[:, 2][:, None, None, None]
+            clip_feat_map_rec * router_logits[:, 2][:, None, None, None]
         # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
 
         # Calculate the probability distribution of router_logits
@@ -404,7 +339,7 @@ class Net(nn.Module):
         l_new = l_new + dino_feature_res * \
             router_logits[:, 0][:, None, None, None] + \
             sam_feature_res * router_logits[:, 1][:, None, None, None] + \
-            clip_res * router_logits[:, 2][:, None, None, None]
+            clip_feat_map_res * router_logits[:, 2][:, None, None, None]
         # l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
 
         x_ = [s_new, m_new, l_new]
@@ -455,7 +390,9 @@ class Net(nn.Module):
             predict_masks = self.ensure_float32(predict_masks)
             loss_seg = self.seg_head(
                 seg_emb, box_gt, predict_masks, pred_boxes, epoch)
-            return loss_det, loss_seg
+            # --- LOSS CLIP MỚI ---
+            loss_clip = self.get_region_clip_loss(x_new, clip_txt_emb)
+            return loss_det, loss_seg, loss_clip
         else:
             predictions_s = self.head(x_new, y_new)
             predictions_list = [predictions_s]
