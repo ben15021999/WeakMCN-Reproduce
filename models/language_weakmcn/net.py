@@ -93,15 +93,15 @@ class Net(nn.Module):
         self.linear_dino_rec = nn.Linear(768, __C.WREC_DIM)
         self.linear_dino_res = nn.Linear(768, __C.WREC_DIM)
 
-
         # load CLIP model
         # --- THÊM ---
         self.clip_processor = CLIPProcessor.from_pretrained(
             "openai/clip-vit-base-patch32")
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        self.clip_model = CLIPModel.from_pretrained(
+            "openai/clip-vit-base-patch32")
 
-        self.linear_clip_rec = nn.Linear(512, __C.WREC_DIM)
-        self.linear_clip_res = nn.Linear(512, __C.WREC_DIM)
+        self.linear_clip_rec = nn.Linear(768, __C.WREC_DIM)
+        self.linear_clip_res = nn.Linear(768, __C.WREC_DIM)
 
         # Head để align anchor feature của bạn với không gian CLIP
         self.clip_align_proj = nn.Linear(__C.HIDDEN_SIZE, 512)
@@ -213,24 +213,38 @@ class Net(nn.Module):
         position_embeddings = self.pos_encoder(scaled_bbox)
         return position_embeddings
 
-    def get_clip_features(self, images_unnorm, raw_texts):
-        # images_unnorm: [B,3,H,W] đã reverse_normalization, range [0,1]
-        # raw_texts: list string, ví dụ ["the man in red shirt", ...]
-        inputs = self.clip_processor(text=raw_texts, images=images_unnorm,
-                                    return_tensors="pt", padding=True, truncation=True)
-        inputs = {k: v.to(images_unnorm.device) for k, v in inputs.items() if k in [
-            'iput_ids', 'attention_mask', 'pixel_values']}
+    def get_clip_features(self, images_unnorm_224, raw_texts):
+        # images_unnorm_224: [B,3,224,224] range [0,1] sau khi reverse_normalization
+        # raw_texts: list[str]
+        device = images_unnorm_224.device
 
-        with torch.no_grad():  # CLIP frozen làm teacher
-            text_emb = self.clip_model.get_text_features(input_ids=inputs['input_ids'],
-                                                        attention_mask=inputs['attention_mask'])
-            image_emb = self.clip_model.get_image_features(
-                pixel_values=inputs['pixel_values'])
+        # Text - dùng tokenizer riêng, không dùng processor chung
+        text_inputs = self.clip_processor.tokenizer(
+            raw_texts, padding=True, truncation=True, max_length=77, return_tensors="pt"
+        )
+        text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
 
-        text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
-        image_emb = image_emb / image_emb.norm(dim=-1, keepdim=True)
-        return image_emb, text_emb  # [B,512]
+        # Image - CLIP norm thủ công
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073],
+                            device=device).view(1, 3, 1, 1)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711],
+                           device=device).view(1, 3, 1, 1)
+        pixel_values = (images_unnorm_224 - mean) / std
 
+        with torch.no_grad():
+            # Dùng text_model và vision_model cho ổn định mọi version transformers
+            txt_out = self.clip_model.text_model(**text_inputs)
+            text_emb = txt_out.pooler_output  # [B,512]
+            # hoặc text_emb = txt_out.last_hidden_state[:,0,:]
+
+            vis_out = self.clip_model.vision_model(pixel_values=pixel_values)
+            image_emb = vis_out.pooler_output  # [B,512]
+
+        text_emb = text_emb / \
+            text_emb.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        image_emb = image_emb / \
+            image_emb.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        return image_emb, text_emb
 
     def get_region_clip_loss(self, x_new, text_emb_clip):
         # x_new: [B, sel_num, HIDDEN] là anchor feature sau khi + position embedding
@@ -238,7 +252,8 @@ class Net(nn.Module):
         v_proj = self.clip_align_proj(x_new)  # [B, sel_num, 512]
         v_proj = v_proj / v_proj.norm(dim=-1, keepdim=True)
         # lấy max similarity trong sel_num anchors
-        sim = (v_proj @ text_emb_clip.unsqueeze(-1)).squeeze(-1)  # [B, sel_num]
+        sim = (v_proj @ text_emb_clip.unsqueeze(-1)
+               ).squeeze(-1)  # [B, sel_num]
         max_sim, _ = sim.max(dim=1)
         loss_clip = (1 - max_sim).mean()  # InfoNCE đơn giản
         return loss_clip
@@ -260,13 +275,15 @@ class Net(nn.Module):
             x_unnorm = self.reverse_normalization(x)
             # PATCH32 NÊN DÙNG 336 THAY VÌ 224 ĐỂ ĐỠ MÙ
             # 336 / 32 = 10.5 -> HF sẽ interpolate thành 10x10, đẹp hơn 7x7
-            x_clip_input = F.interpolate(x_unnorm, size=(
+            # x_clip_input = F.interpolate(x_unnorm, size=(
+            #     224, 224), mode='bilinear', align_corners=False)
+            # x_clip_input = (x_clip_input - self.clip_mean.to(x.device)) / \
+            #     self.clip_std.to(x.device)
+            resized_for_clip_224 = F.interpolate(x_unnorm, size=(
                 224, 224), mode='bilinear', align_corners=False)
-            x_clip_input = (x_clip_input - self.clip_mean.to(x.device)) / \
-                self.clip_std.to(x.device)
 
             clip_img_emb, clip_txt_emb = self.get_clip_features(
-                x_unnorm, raw_texts)
+                resized_for_clip_224, raw_texts)
 
         y_ = self.lang_encoder(y)
 
@@ -308,12 +325,13 @@ class Net(nn.Module):
         sam_feature_res = F.interpolate(sam_feature_res, size=(
             52, 52), mode='bilinear', align_corners=False)
 
-
         # Project clip
-        clip_feat_map_rec = clip_img_emb[:, :, None, None].expand(-1, -1, 13, 13)
+        clip_feat_map_rec = clip_img_emb[:, :,
+                                         None, None].expand(-1, -1, 13, 13)
         clip_feat_map_rec = self.linear_clip_rec(
             clip_feat_map_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        clip_feat_map_res = clip_img_emb[:, :, None, None].expand(-1, -1, 52, 52)
+        clip_feat_map_res = clip_img_emb[:, :,
+                                         None, None].expand(-1, -1, 52, 52)
         clip_feat_map_res = self.linear_clip_res(
             clip_feat_map_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 

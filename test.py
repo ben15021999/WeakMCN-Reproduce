@@ -107,7 +107,7 @@ def validate_box_and_mask(__C,
             box_iter = box_iter.cuda(non_blocking=True)
             gt_box_iter = gt_box_iter.cuda(non_blocking=True)
             box, mask = net(image_iter, ref_iter, box_gt=box_iter,
-                            mask_gt=mask_iter, info_iter=info_iter)
+                            mask_gt=mask_iter, info_iter=info_iter, raw_texts=ref_txt)
 
             # timelist = []
             # for i in range(100):
@@ -232,7 +232,7 @@ def validate(__C,
             gt_box_iter = gt_box_iter.cuda(non_blocking=True)
 
             box, _ = net(image_iter, ref_iter,
-                         __C.USING_CHECKPOINT, gt_box_iter, info_iter)
+                         __C.USING_CHECKPOINT, gt_box_iter, info_iter, raw_texts=ref_txt)
             ######## Visualization ##########
             # box = box.squeeze(1)
             # # box = net(image_iter, ref_iter)  # [left_bottom_x, left_bottom_y, right_top_x, right_top_y]
