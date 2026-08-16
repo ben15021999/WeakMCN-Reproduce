@@ -116,11 +116,6 @@ class Net(nn.Module):
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
         self.pixel_std = torch.tensor(__C.STD).view(-1, 1, 1)
 
-        # mean/std của CLIP
-        self.clip_mean = torch.tensor(
-            [0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
-        self.clip_std = torch.tensor(
-            [0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
         self.pos_encoder = PositionEmbeddingSine()
 
         if __C.VIS_FREEZE:
