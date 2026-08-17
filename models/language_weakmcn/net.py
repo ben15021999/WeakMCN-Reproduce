@@ -246,20 +246,61 @@ class Net(nn.Module):
             image_emb.norm(dim=-1, keepdim=True).clamp(min=1e-6)
         return image_emb, text_emb
 
-    def get_region_clip_loss(self, x_new, text_emb_clip):
-        # x_new: [B, sel_num, HIDDEN] là anchor feature sau khi + position embedding
-        # Dùng anchor được chọn có score cao nhất để align với text
-        v_proj = self.clip_align_proj(x_new)  # [B, sel_num, 512]
-        v_proj = v_proj / v_proj.norm(dim=-1, keepdim=True)
-        # lấy max similarity trong sel_num anchors
-        sim = (v_proj @ text_emb_clip.unsqueeze(-1)
-               ).squeeze(-1)  # [B, sel_num]
+    def get_region_clip_loss(self, x_new, text_emb_clip, temperature=0.07):
+        """
+        InfoNCE between selected visual anchors and CLIP text embeddings.
 
-        # max_sim, _ = sim.max(dim=1)
-        # loss_clip = (1 - max_sim).mean()  # InfoNCE đơn giản
-        # Dùng LogSumExp để xấp xỉ smooth-max
-        tau = 0.07  # temperature parameter
-        loss_clip = - (sim / tau).logsumexp(dim=1).mean()
+        x_new:
+            [B, N, HIDDEN_SIZE]
+        text_emb_clip:
+            [B, 512]
+        """
+
+        # Project WeakMCN anchor features into CLIP space
+        visual_emb = self.clip_align_proj(x_new)       # [B, N, 512]
+        visual_emb = F.normalize(visual_emb, dim=-1)
+
+        text_emb = F.normalize(text_emb_clip, dim=-1)  # [B, 512]
+
+        # Aggregate selected anchors.
+        # Soft attention is preferable to simple mean because
+        # only some anchors may correspond to the expression.
+        anchor_score = torch.matmul(
+            visual_emb,
+            text_emb.unsqueeze(-1)
+        ).squeeze(-1)                                  # [B, N]
+
+        anchor_weight = F.softmax(
+            anchor_score / temperature,
+            dim=-1
+        )
+
+        region_emb = torch.sum(
+            visual_emb * anchor_weight.unsqueeze(-1),
+            dim=1
+        )                                               # [B, 512]
+
+        region_emb = F.normalize(region_emb, dim=-1)
+
+        # Image -> Text similarity
+        logits_i2t = torch.matmul(
+            region_emb,
+            text_emb.t()
+        ) / temperature                                 # [B, B]
+
+        # Text -> Image similarity
+        logits_t2i = logits_i2t.t()                     # [B, B]
+
+        labels = torch.arange(
+            region_emb.size(0),
+            device=region_emb.device
+        )
+
+        loss_i2t = F.cross_entropy(logits_i2t, labels)
+        loss_t2i = F.cross_entropy(logits_t2i, labels)
+
+        loss_clip = 0.5 * (loss_i2t + loss_t2i)
+
         return loss_clip
 
     def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None, raw_texts=None):
