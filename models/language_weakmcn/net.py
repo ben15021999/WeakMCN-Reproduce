@@ -254,8 +254,12 @@ class Net(nn.Module):
         # lấy max similarity trong sel_num anchors
         sim = (v_proj @ text_emb_clip.unsqueeze(-1)
                ).squeeze(-1)  # [B, sel_num]
-        max_sim, _ = sim.max(dim=1)
-        loss_clip = (1 - max_sim).mean()  # InfoNCE đơn giản
+
+        # max_sim, _ = sim.max(dim=1)
+        # loss_clip = (1 - max_sim).mean()  # InfoNCE đơn giản
+        # Dùng LogSumExp để xấp xỉ smooth-max
+        tau = 0.07  # temperature parameter
+        loss_clip = - (sim / tau).logsumexp(dim=1).mean()
         return loss_clip
 
     def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None, raw_texts=None):
