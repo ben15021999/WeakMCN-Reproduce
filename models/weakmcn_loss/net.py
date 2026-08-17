@@ -1,16 +1,15 @@
-# coding=utf-8
 import torch
 import torch.nn as nn
 from models.language_encoder import language_encoder
 from models.visual_encoder import visual_encoder
-from models.weakmcn_loss.head import WeakREChead
+from models.language_weakmcn.head import WeakREChead
 from models.network_blocks import MultiScaleFusion, SimpleFusion, GaranAttention
-from models.weakmcn_loss.seg_head import REShead
+from models.language_weakmcn.seg_head import REShead
 from EfficientSAM.efficient_sam.build_efficient_sam import build_efficient_sam_vitt, build_efficient_sam_vits
 from utils.utils import clip_boxes_to_image
 import math
 import torch.nn.functional as F
-from transformers import Dinov2Model
+from transformers import Dinov2Model, CLIPModel, CLIPProcessor
 
 
 class PositionEmbeddingSine(nn.Module):
@@ -94,18 +93,48 @@ class Net(nn.Module):
         self.linear_dino_rec = nn.Linear(768, __C.WREC_DIM)
         self.linear_dino_res = nn.Linear(768, __C.WREC_DIM)
 
-        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
-        self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
+        # load CLIP model
+        # --- THÊM ---
+        self.clip_processor = CLIPProcessor.from_pretrained(
+            "openai/clip-vit-base-patch32")
+        self.clip_model = CLIPModel.from_pretrained(
+            "openai/clip-vit-base-patch32")
+
+        self.linear_clip_rec = nn.Linear(768, __C.WREC_DIM)
+        self.linear_clip_res = nn.Linear(768, __C.WREC_DIM)
+
+        # Head để align anchor feature của bạn với không gian CLIP
+        self.clip_align_proj = nn.Linear(__C.HIDDEN_SIZE, 512)
+
+        self.clip_router_rec = nn.Sequential(
+            nn.Linear(512, __C.WREC_DIM),
+            nn.ReLU(),
+            nn.Linear(__C.WREC_DIM, 3)
+        )
+
+        self.clip_router_res = nn.Sequential(
+            nn.Linear(512, __C.WRES_DIM),
+            nn.ReLU(),
+            nn.Linear(__C.WRES_DIM, 3)
+        )
+
+        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 3)
+        self.linear_router_res = nn.Linear(__C.WREC_DIM, 3)
+        # Input dim = WREC_DIM (Visual) + 512 (Language Feature Dim)
+        # in_dim_rec = __C.WREC_DIM + 512
+        # in_dim_res = __C.WREC_DIM + 512  # Hoặc WREC_DIM tùy theo kích thước layer l_new
 
         self.class_num = __C.CLASS_NUM
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
         self.pixel_std = torch.tensor(__C.STD).view(-1, 1, 1)
+
         self.pos_encoder = PositionEmbeddingSine()
 
         if __C.VIS_FREEZE:
             self.frozen(self.visual_encoder)
             self.frozen(self.efficientsam)
             self.frozen(self.dino_model)
+            self.frozen(self.clip_model)
 
     def frozen(self, module):
         if getattr(module, 'module', False):
@@ -196,8 +225,44 @@ class Net(nn.Module):
         position_embeddings = self.pos_encoder(scaled_bbox)
         return position_embeddings
 
-    def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None):
-        # Vision and Language Encoding
+    def get_clip_features(self, images_unnorm_224, raw_texts):
+        # images_unnorm_224: [B,3,224,224] range [0,1] sau khi reverse_normalization
+        # raw_texts: list[str]
+        device = images_unnorm_224.device
+
+        # Text - dùng tokenizer riêng, không dùng processor chung
+        text_inputs = self.clip_processor.tokenizer(
+            raw_texts, padding=True, truncation=True, max_length=77, return_tensors="pt"
+        )
+        text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+
+        with torch.no_grad():
+            # Dùng text_model và vision_model cho ổn định mọi version transformers
+            txt_out = self.clip_model.text_model(**text_inputs)
+            text_emb = txt_out.pooler_output  # [B,512]
+
+        text_emb = text_emb / \
+            text_emb.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        return text_emb
+
+    def get_region_clip_loss(self, x_new, text_emb_clip):
+        # x_new: [B, sel_num, HIDDEN] là anchor feature sau khi + position embedding
+        # Dùng anchor được chọn có score cao nhất để align với text
+        v_proj = self.clip_align_proj(x_new)  # [B, sel_num, 512]
+        v_proj = v_proj / v_proj.norm(dim=-1, keepdim=True)
+        # lấy max similarity trong sel_num anchors
+        sim = (v_proj @ text_emb_clip.unsqueeze(-1)
+               ).squeeze(-1)  # [B, sel_num]
+
+        # max_sim, _ = sim.max(dim=1)
+        # loss_clip = (1 - max_sim).mean()  # InfoNCE đơn giản
+        # Dùng LogSumExp để xấp xỉ smooth-max
+        tau = 0.07  # temperature parameter
+        loss_clip = - (sim / tau).logsumexp(dim=1).mean()
+        return loss_clip
+
+    def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None, raw_texts=None):
+        # Vision and Language Encodingå
         with torch.no_grad():
             boxes_all, x_, boxes_sml = self.visual_encoder(x)
 
@@ -210,6 +275,18 @@ class Net(nn.Module):
             sam_feature = self.efficientsam.get_image_embeddings(
                 resized_image_feature_sam).to(x.device)
 
+            x_unnorm = self.reverse_normalization(x)
+            # PATCH32 NÊN DÙNG 336 THAY VÌ 224 ĐỂ ĐỠ MÙ
+            # 336 / 32 = 10.5 -> HF sẽ interpolate thành 10x10, đẹp hơn 7x7
+            # x_clip_input = F.interpolate(x_unnorm, size=(
+            #     224, 224), mode='bilinear', align_corners=False)
+            # x_clip_input = (x_clip_input - self.clip_mean.to(x.device)) / \
+            #     self.clip_std.to(x.device)
+            resized_for_clip_224 = F.interpolate(x_unnorm, size=(
+                224, 224), mode='bilinear', align_corners=False)
+
+            clip_txt_emb = self.get_clip_features(resized_for_clip_224, raw_texts)
+
         y_ = self.lang_encoder(y)
 
         # Vision Multi Scale Fusion
@@ -218,10 +295,21 @@ class Net(nn.Module):
         l_new, m_new, s_new = self.multi_scale_manner(x_input)
 
         # Dynamic routing
-        rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(
-            0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
-        res_feature = F.adaptive_avg_pool2d(l_new, (1, 1)).permute(
-            0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
+        # rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(
+        #     0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
+        # res_feature = F.adaptive_avg_pool2d(l_new, (1, 1)).permute(
+        #     0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
+        # 1. Biến đổi rec_feature & res_feature thành dạng 2D [B, WREC_DIM]
+        rec_feature = F.adaptive_avg_pool2d(
+            s_new, (1, 1)).flatten(1)  # Shape: [B, WREC_DIM]
+        res_feature = F.adaptive_avg_pool2d(
+            l_new, (1, 1)).flatten(1)  # Shape: [B, WRES_DIM]
+
+        clip_semantic_rec = self.clip_router_rec(clip_txt_emb)
+        clip_semantic_res = self.clip_router_res(clip_txt_emb)
+
+        router_input_rec = rec_feature + clip_semantic_rec
+        router_input_res = res_feature + clip_semantic_res
 
         # load dino model
         dino_feature = dino_feature[:, 1:, :]
@@ -245,54 +333,22 @@ class Net(nn.Module):
         sam_feature_res = F.interpolate(sam_feature_res, size=(
             52, 52), mode='bilinear', align_corners=False)
 
-        if not self.training:
-            # Tính độ tương đồng giữa Text Embedding và Visual Features ở chế độ Test
-            y_text_feat = y_['flat_lang_feat']  # [B, 512]
-
-            # REC Feature Weighting
-            dino_rec_flat = F.adaptive_avg_pool2d(
-                dino_feature_rec, (1, 1)).squeeze(-1).squeeze(-1)
-            sam_rec_flat = F.adaptive_avg_pool2d(
-                sam_feature_rec, (1, 1)).squeeze(-1).squeeze(-1)
-            sim_dino_rec = F.cosine_similarity(
-                dino_rec_flat, y_text_feat, dim=-1, eps=1e-6).unsqueeze(-1)
-            sim_sam_rec = F.cosine_similarity(
-                sam_rec_flat, y_text_feat, dim=-1, eps=1e-6).unsqueeze(-1)
-            router_logits_rec = torch.softmax(
-                torch.cat([sim_dino_rec, sim_sam_rec], dim=-1), dim=-1)
-
-            # RES Feature Weighting
-            dino_res_flat = F.adaptive_avg_pool2d(
-                dino_feature_res, (1, 1)).squeeze(-1).squeeze(-1)
-            sam_res_flat = F.adaptive_avg_pool2d(
-                sam_feature_res, (1, 1)).squeeze(-1).squeeze(-1)
-            sim_dino_res = F.cosine_similarity(
-                dino_res_flat, y_text_feat, dim=-1, eps=1e-6).unsqueeze(-1)
-            sim_sam_res = F.cosine_similarity(
-                sam_res_flat, y_text_feat, dim=-1, eps=1e-6).unsqueeze(-1)
-            router_logits_res = torch.softmax(
-                torch.cat([sim_dino_res, sim_sam_res], dim=-1), dim=-1)
-        else:
-            # Giữ nguyên router học khi ở chế độ Train
-            router_logits_rec = torch.softmax(self.linear_router_rec(
-                rec_feature.detach()).squeeze(1), dim=-1)
-            router_logits_res = torch.softmax(self.linear_router_res(
-                res_feature.detach()).squeeze(1), dim=-1)
-
         # Calculate the probability distribution of router_logits
-        # router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
-        # router_logits = torch.softmax(router_logits, dim=-1)
+        router_logits = self.linear_router_rec(router_input_rec.detach()).squeeze(1)
+        router_logits = torch.softmax(router_logits, dim=-1)
+        # # --- ROUTING CHO REC (DETECTION) ---
         s_new = s_new + dino_feature_rec * \
-            router_logits_rec[:, 0][:, None, None, None] + \
-            sam_feature_rec * router_logits_rec[:, 1][:, None, None, None]
+            router_logits[:, 0][:, None, None, None] + \
+            sam_feature_rec * router_logits[:, 1][:, None, None, None]
         # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
 
         # Calculate the probability distribution of router_logits
-        # router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
-        # router_logits = torch.softmax(router_logits, dim=-1)
+        router_logits = self.linear_router_res(router_input_res.detach()).squeeze(1)
+        router_logits = torch.softmax(router_logits, dim=-1)
+        # --- ROUTING CHO RES (SEGMENTATION) ---
         l_new = l_new + dino_feature_res * \
-            router_logits_res[:, 0][:, None, None, None] + \
-            sam_feature_res * router_logits_res[:, 1][:, None, None, None]
+            router_logits[:, 0][:, None, None, None] + \
+            sam_feature_res * router_logits[:, 1][:, None, None, None]
         # l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
 
         x_ = [s_new, m_new, l_new]
@@ -343,30 +399,16 @@ class Net(nn.Module):
             predict_masks = self.ensure_float32(predict_masks)
             loss_seg = self.seg_head(
                 seg_emb, box_gt, predict_masks, pred_boxes, epoch)
-            return loss_det, loss_seg
+            # --- LOSS CLIP MỚI ---
+            loss_clip = self.get_region_clip_loss(x_new, clip_txt_emb)
+            return loss_det, loss_seg, loss_clip
         else:
             predictions_s = self.head(x_new, y_new)
             predictions_list = [predictions_s]
             box_pred = self.get_boxes(
                 boxes_sml_new, predictions_list, self.class_num)
             _, mask_pred = self.seg_head(seg_emb)
-
-            # Lấy Box dự đoán từ REC head làm Prompt cho EfficientSAM
-            prompt, pts_labels = self.generate_prompts(
-                box_pred, using_gt=False)
-            x_unnorm = self.reverse_normalization(x)
-            sam_masks = self.generate_masks(x_unnorm, prompt, pts_labels, self.efficientsam)
-
-            # Refine lại Bounding Box dựa trên Mask chuẩn của SAM
-            refined_box_pred = self.refine_box_from_mask(sam_masks.squeeze(1), box_pred)
-
-            # Hợp nhất Mask từ SAM với Mask từ RESHead (Ensemble mask)
-            combined_mask = (mask_pred.sigmoid() > 0.5).float() * \
-                0.4 + sam_masks.float() * 0.6
-            final_mask_pred = (combined_mask > 0.5).float()
-
-            return refined_box_pred, final_mask_pred
-            # return box_pred, mask_pred
+            return box_pred, mask_pred
 
     def ensure_float32(self, tensor):
         """
@@ -435,38 +477,3 @@ class Net(nn.Module):
         if self.training:
             box_new = box_new[..., :4]
         return box_new
-
-    def refine_box_from_mask(self, predict_masks, original_boxes):
-        """
-        Tạo Bounding Box mới từ vùng Mask của EfficientSAM để tinh chỉnh Box ban đầu.
-        Arguments:
-            predict_masks: [B, H, W] tensor chứa giá trị 0 hoặc 1
-            original_boxes: [B, 1, 4] tensor chứa box ban đầu [x1, y1, x2, y2]
-        """
-        refined_boxes = []
-        batch_size = predict_masks.shape[0]
-
-        for b in range(batch_size):
-            mask = predict_masks[b]
-            y_indices, x_indices = torch.where(mask > 0)
-
-            # Nếu SAM lọc ra được mask hợp lệ
-            if len(x_indices) > 0 and len(y_indices) > 0:
-                x1 = torch.min(x_indices).float()
-                y1 = torch.min(y_indices).float()
-                x2 = torch.max(x_indices).float()
-                y2 = torch.max(y_indices).float()
-
-                # Giới hạn khung hình theo kích thước của input shape
-                x1 = torch.clamp(x1, 0, self.scale_factor_w)
-                y1 = torch.clamp(y1, 0, self.scale_factor_h)
-                x2 = torch.clamp(x2, 0, self.scale_factor_w)
-                y2 = torch.clamp(y2, 0, self.scale_factor_h)
-
-                refined_boxes.append(torch.tensor(
-                    [x1, y1, x2, y2], device=predict_masks.device))
-            else:
-                # Nếu mask rỗng, giữ nguyên box ban đầu từ REC head
-                refined_boxes.append(original_boxes[b, 0, :4])
-
-        return torch.stack(refined_boxes, dim=0).unsqueeze(1)
