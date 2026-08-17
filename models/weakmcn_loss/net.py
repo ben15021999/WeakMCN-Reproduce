@@ -255,7 +255,7 @@ class Net(nn.Module):
         return loss_clip
 
     def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None, raw_texts=None):
-        # Vision and Language Encodingå
+        # Vision and Language Encoding
         with torch.no_grad():
             boxes_all, x_, boxes_sml = self.visual_encoder(x)
 
@@ -288,11 +288,6 @@ class Net(nn.Module):
         res_feature = F.adaptive_avg_pool2d(
             l_new, (1, 1)).flatten(1)  # Shape: [B, WRES_DIM]
 
-        clip_semantic_rec = self.clip_router_rec(clip_txt_emb)
-        clip_semantic_res = self.clip_router_res(clip_txt_emb)
-
-        router_input_rec = rec_feature + clip_semantic_rec
-        router_input_res = res_feature + clip_semantic_res
 
         # load dino model
         dino_feature = dino_feature[:, 1:, :]
@@ -317,7 +312,7 @@ class Net(nn.Module):
             52, 52), mode='bilinear', align_corners=False)
 
         # Calculate the probability distribution of router_logits
-        router_logits = self.linear_router_rec(router_input_rec.detach()).squeeze(1)
+        router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
         router_logits = torch.softmax(router_logits, dim=-1)
         # # --- ROUTING CHO REC (DETECTION) ---
         s_new = s_new + dino_feature_rec * \
@@ -326,7 +321,7 @@ class Net(nn.Module):
         # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
 
         # Calculate the probability distribution of router_logits
-        router_logits = self.linear_router_res(router_input_res.detach()).squeeze(1)
+        router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
         router_logits = torch.softmax(router_logits, dim=-1)
         # --- ROUTING CHO RES (SEGMENTATION) ---
         l_new = l_new + dino_feature_res * \

@@ -231,7 +231,7 @@ class Net(nn.Module):
                            device=device).view(1, 3, 1, 1)
         pixel_values = (images_unnorm_224 - mean) / std
 
-        with torch.no_grad():
+        with torch.inference_mode():
             # Dùng text_model và vision_model cho ổn định mọi version transformers
             txt_out = self.clip_model.text_model(**text_inputs)
             text_emb = txt_out.pooler_output  # [B,512]
@@ -263,7 +263,7 @@ class Net(nn.Module):
         return loss_clip
 
     def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None, raw_texts=None):
-        # Vision and Language Encodingå
+        # Vision and Language Encoding
         with torch.no_grad():
             boxes_all, x_, boxes_sml = self.visual_encoder(x)
 
