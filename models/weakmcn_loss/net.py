@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 from models.language_encoder import language_encoder
 from models.visual_encoder import visual_encoder
-from models.language_weakmcn.head import WeakREChead
+from models.weakmcn_loss.head import WeakREChead
 from models.network_blocks import MultiScaleFusion, SimpleFusion, GaranAttention
-from models.language_weakmcn.seg_head import REShead
+from models.weakmcn_loss.seg_head import REShead
 from EfficientSAM.efficient_sam.build_efficient_sam import build_efficient_sam_vitt, build_efficient_sam_vits
 from utils.utils import clip_boxes_to_image
 import math
@@ -100,9 +100,6 @@ class Net(nn.Module):
         self.clip_model = CLIPModel.from_pretrained(
             "openai/clip-vit-base-patch32")
 
-        self.linear_clip_rec = nn.Linear(768, __C.WREC_DIM)
-        self.linear_clip_res = nn.Linear(768, __C.WREC_DIM)
-
         # Head để align anchor feature của bạn với không gian CLIP
         self.clip_align_proj = nn.Linear(__C.HIDDEN_SIZE, 512)
 
@@ -118,11 +115,8 @@ class Net(nn.Module):
             nn.Linear(__C.WRES_DIM, 3)
         )
 
-        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 3)
-        self.linear_router_res = nn.Linear(__C.WREC_DIM, 3)
-        # Input dim = WREC_DIM (Visual) + 512 (Language Feature Dim)
-        # in_dim_rec = __C.WREC_DIM + 512
-        # in_dim_res = __C.WREC_DIM + 512  # Hoặc WREC_DIM tùy theo kích thước layer l_new
+        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
+        self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
 
         self.class_num = __C.CLASS_NUM
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
@@ -225,10 +219,9 @@ class Net(nn.Module):
         position_embeddings = self.pos_encoder(scaled_bbox)
         return position_embeddings
 
-    def get_clip_features(self, images_unnorm_224, raw_texts):
+    def get_clip_features(self, raw_texts, device):
         # images_unnorm_224: [B,3,224,224] range [0,1] sau khi reverse_normalization
         # raw_texts: list[str]
-        device = images_unnorm_224.device
 
         # Text - dùng tokenizer riêng, không dùng processor chung
         text_inputs = self.clip_processor.tokenizer(
@@ -236,7 +229,7 @@ class Net(nn.Module):
         )
         text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
 
-        with torch.no_grad():
+        with torch.inference_mode():
             # Dùng text_model và vision_model cho ổn định mọi version transformers
             txt_out = self.clip_model.text_model(**text_inputs)
             text_emb = txt_out.pooler_output  # [B,512]
@@ -275,17 +268,7 @@ class Net(nn.Module):
             sam_feature = self.efficientsam.get_image_embeddings(
                 resized_image_feature_sam).to(x.device)
 
-            x_unnorm = self.reverse_normalization(x)
-            # PATCH32 NÊN DÙNG 336 THAY VÌ 224 ĐỂ ĐỠ MÙ
-            # 336 / 32 = 10.5 -> HF sẽ interpolate thành 10x10, đẹp hơn 7x7
-            # x_clip_input = F.interpolate(x_unnorm, size=(
-            #     224, 224), mode='bilinear', align_corners=False)
-            # x_clip_input = (x_clip_input - self.clip_mean.to(x.device)) / \
-            #     self.clip_std.to(x.device)
-            resized_for_clip_224 = F.interpolate(x_unnorm, size=(
-                224, 224), mode='bilinear', align_corners=False)
-
-            clip_txt_emb = self.get_clip_features(resized_for_clip_224, raw_texts)
+            clip_txt_emb = self.get_clip_features(raw_texts, x.device)
 
         y_ = self.lang_encoder(y)
 
