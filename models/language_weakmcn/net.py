@@ -214,37 +214,35 @@ class Net(nn.Module):
         return position_embeddings
 
     def get_clip_features(self, images_unnorm_224, raw_texts):
-        # images_unnorm_224: [B,3,224,224] range [0,1] sau khi reverse_normalization
-        # raw_texts: list[str]
         device = images_unnorm_224.device
+        dtype = images_unnorm_224.dtype
+        images_unnorm_224 = images_unnorm_224.clamp(0, 1)
 
-        # Text - dùng tokenizer riêng, không dùng processor chung
         text_inputs = self.clip_processor.tokenizer(
             raw_texts, padding=True, truncation=True, max_length=77, return_tensors="pt"
         )
         text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
 
-        # Image - CLIP norm thủ công
-        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073],
-                            device=device).view(1, 3, 1, 1)
-        std = torch.tensor([0.26862954, 0.26130258, 0.27577711],
-                           device=device).view(1, 3, 1, 1)
+        mean = torch.tensor(self.clip_processor.image_processor.image_mean,
+                            device=device, dtype=dtype).view(1, 3, 1, 1)
+        std = torch.tensor(self.clip_processor.image_processor.image_std,
+                        device=device, dtype=dtype).view(1, 3, 1, 1)
         pixel_values = (images_unnorm_224 - mean) / std
+        with torch.no_grad():
+            # Dùng API chuẩn của CLIPModel, không dùng text_model.pooler_output
+            text_emb = self.clip_model.get_text_features(**text_inputs)  # [B,512]
+            vision_out = self.clip_model.vision_model(pixel_values=pixel_values)
 
-        with torch.inference_mode():
-            # Dùng text_model và vision_model cho ổn định mọi version transformers
-            txt_out = self.clip_model.text_model(**text_inputs)
-            text_emb = txt_out.pooler_output  # [B,512]
-            # hoặc text_emb = txt_out.last_hidden_state[:,0,:]
+        last_hidden = vision_out.last_hidden_state  # [B, 50, 768]
+        patch_tokens = last_hidden[:, 1:, :]  # [B, 49, 768]
+        patch_tokens = self.clip_model.visual_projection(
+            patch_tokens)  # [B, 49, 512]
 
-            vis_out = self.clip_model.vision_model(pixel_values=pixel_values)
-            image_emb = vis_out.pooler_output  # [B,512]
+        B, N, C = patch_tokens.shape
+        H = W = int(N**0.5)  # 7 với 224/32
+        patch_map = patch_tokens.transpose(1, 2).view(B, C, H, W)  # [B,512,7,7]
 
-        text_emb = text_emb / \
-            text_emb.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        image_emb = image_emb / \
-            image_emb.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        return image_emb, text_emb
+        return F.normalize(patch_map, dim=1), F.normalize(text_emb, dim=-1)
 
     def get_region_clip_loss(self, x_new, text_emb_clip, temperature=0.07):
         """
@@ -319,11 +317,6 @@ class Net(nn.Module):
 
             x_unnorm = self.reverse_normalization(x)
             # PATCH32 NÊN DÙNG 336 THAY VÌ 224 ĐỂ ĐỠ MÙ
-            # 336 / 32 = 10.5 -> HF sẽ interpolate thành 10x10, đẹp hơn 7x7
-            # x_clip_input = F.interpolate(x_unnorm, size=(
-            #     224, 224), mode='bilinear', align_corners=False)
-            # x_clip_input = (x_clip_input - self.clip_mean.to(x.device)) / \
-            #     self.clip_std.to(x.device)
             resized_for_clip_224 = F.interpolate(x_unnorm, size=(
                 224, 224), mode='bilinear', align_corners=False)
 
@@ -371,14 +364,24 @@ class Net(nn.Module):
             52, 52), mode='bilinear', align_corners=False)
 
         # Project clip
-        clip_feat_map_rec = clip_img_emb[:, :,
-                                         None, None].expand(-1, -1, 13, 13)
+        # [B, 49, 512] với 224/32=7
+        clip_feat_map_rec = F.interpolate(
+            clip_img_emb, size=(13, 13), mode='bilinear')
         clip_feat_map_rec = self.linear_clip_rec(
             clip_feat_map_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        clip_feat_map_res = clip_img_emb[:, :,
-                                         None, None].expand(-1, -1, 52, 52)
+        clip_feat_map_res = F.interpolate(
+            clip_img_emb, size=(52, 52), mode='bilinear')
         clip_feat_map_res = self.linear_clip_res(
             clip_feat_map_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+        # clip_feat_map_rec = clip_img_emb[:, :,
+        #                                  None, None].expand(-1, -1, 13, 13)
+        # clip_feat_map_rec = self.linear_clip_rec(
+        #     clip_feat_map_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        # clip_feat_map_res = clip_img_emb[:, :,
+        #                                  None, None].expand(-1, -1, 52, 52)
+        # clip_feat_map_res = self.linear_clip_res(
+        #     clip_feat_map_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         # Calculate the probability distribution of router_logits
         router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
