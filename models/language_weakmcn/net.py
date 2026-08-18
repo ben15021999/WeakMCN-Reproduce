@@ -214,90 +214,60 @@ class Net(nn.Module):
         return position_embeddings
 
     def get_clip_features(self, images_unnorm_224, raw_texts):
+        # images_unnorm_224: [B,3,224,224] range [0,1] sau khi reverse_normalization
+        # raw_texts: list[str]
         device = images_unnorm_224.device
         dtype = images_unnorm_224.dtype
-        images_unnorm_224 = images_unnorm_224.clamp(0, 1)
 
+        # Text - dùng tokenizer riêng, không dùng processor chung
         text_inputs = self.clip_processor.tokenizer(
             raw_texts, padding=True, truncation=True, max_length=77, return_tensors="pt"
         )
         text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
 
+        # Image - CLIP norm thủ công
         mean = torch.tensor(self.clip_processor.image_processor.image_mean,
                             device=device, dtype=dtype).view(1, 3, 1, 1)
         std = torch.tensor(self.clip_processor.image_processor.image_std,
-                        device=device, dtype=dtype).view(1, 3, 1, 1)
+                           device=device, dtype=dtype).view(1, 3, 1, 1)
         pixel_values = (images_unnorm_224 - mean) / std
+
         with torch.no_grad():
-            # Dùng API chuẩn của CLIPModel, không dùng text_model.pooler_output
-            text_emb = self.clip_model.get_text_features(**text_inputs)  # [B,512]
-            vision_out = self.clip_model.vision_model(pixel_values=pixel_values)
+            # Dùng text_model và vision_model cho ổn định mọi version transformers
+            txt_out = self.clip_model.text_model(**text_inputs)
+            text_emb = txt_out.pooler_output  # [B,512]
+            # hoặc text_emb = txt_out.last_hidden_state[:,0,:]
 
-        last_hidden = vision_out.last_hidden_state  # [B, 50, 768]
-        patch_tokens = last_hidden[:, 1:, :]  # [B, 49, 768]
-        patch_tokens = self.clip_model.visual_projection(
-            patch_tokens)  # [B, 49, 512]
+            vis_out = self.clip_model.vision_model(pixel_values=pixel_values)
+            image_emb = vis_out.pooler_output  # [B,512]
 
-        B, N, C = patch_tokens.shape
-        H = W = int(N**0.5)  # 7 với 224/32
-        patch_map = patch_tokens.transpose(1, 2).view(B, C, H, W)  # [B,512,7,7]
+        text_emb = text_emb / \
+            text_emb.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        image_emb = image_emb / \
+            image_emb.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        return image_emb, text_emb
 
-        return F.normalize(patch_map, dim=1), F.normalize(text_emb, dim=-1)
+    def get_region_clip_loss(self, x_new, text_emb_clip):
+        # Chiếu và Norm
+        v_proj = F.normalize(self.clip_align_proj(x_new),
+                             dim=-1)  # [B, sel_num, 512]
+        text_emb_clip = F.normalize(text_emb_clip, dim=-1)          # [B, 512]
 
-    def get_region_clip_loss(self, x_new, text_emb_clip, temperature=0.07):
-        """
-        InfoNCE between selected visual anchors and CLIP text embeddings.
+        # Tính similarity: [B, sel_num]
+        sim = (v_proj @ text_emb_clip.unsqueeze(-1)).squeeze(-1)
 
-        x_new:
-            [B, N, HIDDEN_SIZE]
-        text_emb_clip:
-            [B, 512]
-        """
+        # Scale similarity (temperature)
+        logits = sim * 100.0  # Tương đương tau = 0.01
 
-        # Project WeakMCN anchor features into CLIP space
-        visual_emb = self.clip_align_proj(x_new)       # [B, N, 512]
-        visual_emb = F.normalize(visual_emb, dim=-1)
+        # Tính xác suất qua Softmax (Softmax trên chiều sel_num)
+        probs = F.softmax(logits, dim=1)  # [B, sel_num]
 
-        text_emb = F.normalize(text_emb_clip, dim=-1)  # [B, 512]
+        # MIL Loss: Kì vọng rằng mô hình "chú ý" (attention) vào một vùng nào đó
+        # Tính điểm tổng hợp (aggregated score) của cả bức ảnh so với text
+        aggregated_score = (probs * sim).sum(dim=1)  # [B]
 
-        # Aggregate selected anchors.
-        # Soft attention is preferable to simple mean because
-        # only some anchors may correspond to the expression.
-        anchor_score = torch.matmul(
-            visual_emb,
-            text_emb.unsqueeze(-1)
-        ).squeeze(-1)                                  # [B, N]
-
-        anchor_weight = F.softmax(
-            anchor_score / temperature,
-            dim=-1
-        )
-
-        region_emb = torch.sum(
-            visual_emb * anchor_weight.unsqueeze(-1),
-            dim=1
-        )                                               # [B, 512]
-
-        region_emb = F.normalize(region_emb, dim=-1)
-
-        # Image -> Text similarity
-        logits_i2t = torch.matmul(
-            region_emb,
-            text_emb.t()
-        ) / temperature                                 # [B, B]
-
-        # Text -> Image similarity
-        logits_t2i = logits_i2t.t()                     # [B, B]
-
-        labels = torch.arange(
-            region_emb.size(0),
-            device=region_emb.device
-        )
-
-        loss_i2t = F.cross_entropy(logits_i2t, labels)
-        loss_t2i = F.cross_entropy(logits_t2i, labels)
-
-        loss_clip = 0.5 * (loss_i2t + loss_t2i)
+        # Loss: tối đa hóa aggregated_score (Cosine distance)
+        loss_clip = (1.0 - aggregated_score).mean()
 
         return loss_clip
 
@@ -365,23 +335,38 @@ class Net(nn.Module):
 
         # Project clip
         # [B, 49, 512] với 224/32=7
-        clip_feat_map_rec = F.interpolate(
-            clip_img_emb, size=(13, 13), mode='bilinear')
-        clip_feat_map_rec = self.linear_clip_rec(
-            clip_feat_map_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        clip_feat_map_res = F.interpolate(
-            clip_img_emb, size=(52, 52), mode='bilinear')
-        clip_feat_map_res = self.linear_clip_res(
-            clip_feat_map_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-
-        # clip_feat_map_rec = clip_img_emb[:, :,
-        #                                  None, None].expand(-1, -1, 13, 13)
+        # clip_feat_map_rec = F.interpolate(
+        #     clip_img_emb, size=(13, 13), mode='bilinear', align_corners=False)
         # clip_feat_map_rec = self.linear_clip_rec(
         #     clip_feat_map_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        # clip_feat_map_res = clip_img_emb[:, :,
-        #                                  None, None].expand(-1, -1, 52, 52)
+        # clip_feat_map_res = F.interpolate(
+        #     clip_img_emb, size=(52, 52), mode='bilinear', align_corners=False)
         # clip_feat_map_res = self.linear_clip_res(
         #     clip_feat_map_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        # clip_feat_map_rec = self.linear_clip_rec(
+        #     clip_img_emb.permute(0, 2, 3, 1)
+        # ).permute(0, 3, 1, 2)
+
+        # clip_feat_map_res = self.linear_clip_res(
+        #     clip_img_emb.permute(0, 2, 3, 1)
+        # ).permute(0, 3, 1, 2)
+
+        # clip_feat_map_rec = F.interpolate(
+        #     clip_feat_map_rec, size=(13, 13), mode='bilinear', align_corners=False
+        # )
+
+        # clip_feat_map_res = F.interpolate(
+        #     clip_feat_map_res, size=(52, 52), mode='bilinear', align_corners=False
+        # )
+
+        clip_feat_map_rec = clip_img_emb[:, :,
+                                         None, None].expand(-1, -1, 13, 13)
+        clip_feat_map_rec = self.linear_clip_rec(
+            clip_feat_map_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        clip_feat_map_res = clip_img_emb[:, :,
+                                         None, None].expand(-1, -1, 52, 52)
+        clip_feat_map_res = self.linear_clip_res(
+            clip_feat_map_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         # Calculate the probability distribution of router_logits
         router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)

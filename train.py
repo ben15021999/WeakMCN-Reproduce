@@ -273,6 +273,12 @@ def main_worker(gpu, __C):
                 new_dict[new_k] = checkpoint['state_dict'][k]
         if len(new_dict.keys()) == 0:
             new_dict = checkpoint['state_dict']
+        state_dict = checkpoint['state_dict']
+
+        # Lọc bỏ các keys cũ không dùng nữa
+        keys_to_remove = [k for k in state_dict.keys() if 'clip_mean' in k or 'clip_std' in k]
+        for key in keys_to_remove:
+            del state_dict[key]
         net.load_state_dict(checkpoint['state_dict'])
         # net.load_state_dict(new_dict)
         optimizer.load_state_dict(checkpoint['optimizer'])

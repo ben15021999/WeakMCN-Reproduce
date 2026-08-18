@@ -1,16 +1,15 @@
-import torch
-import torch.nn as nn
-from models.language_encoder import language_encoder
-from models.visual_encoder import visual_encoder
-from models.weakmcn_loss.head import WeakREChead
-from models.network_blocks import MultiScaleFusion, SimpleFusion, GaranAttention
-from models.weakmcn_loss.seg_head import REShead
-from EfficientSAM.efficient_sam.build_efficient_sam import build_efficient_sam_vitt, build_efficient_sam_vits
-from utils.utils import clip_boxes_to_image
 import math
+from utils.utils import clip_boxes_to_image
+from EfficientSAM.efficient_sam.build_efficient_sam import build_efficient_sam_vitt, build_efficient_sam_vits
+from models.weakmcn_loss.seg_head import REShead
+from models.network_blocks import MultiScaleFusion, SimpleFusion, GaranAttention
+from models.weakmcn_loss.head import WeakREChead
+from models.visual_encoder import visual_encoder
+from models.language_encoder import language_encoder
+import torch.nn as nn
+import torch
 import torch.nn.functional as F
-from transformers import Dinov2Model, CLIPModel, CLIPProcessor
-
+from transformers import Dinov2Model, CLIPVisionModel
 
 class PositionEmbeddingSine(nn.Module):
     """
@@ -95,28 +94,13 @@ class Net(nn.Module):
 
         # load CLIP model
         # --- THÊM ---
-        self.clip_processor = CLIPProcessor.from_pretrained(
+        self.clip_model = CLIPVisionModel.from_pretrained(
             "openai/clip-vit-base-patch32")
-        self.clip_model = CLIPModel.from_pretrained(
-            "openai/clip-vit-base-patch32")
+        self.linear_clip_rec = nn.Linear(768, __C.WREC_DIM)
+        self.linear_clip_res = nn.Linear(768, __C.WREC_DIM)
 
-        # Head để align anchor feature của bạn với không gian CLIP
-        self.clip_align_proj = nn.Linear(__C.HIDDEN_SIZE, 512)
-
-        self.clip_router_rec = nn.Sequential(
-            nn.Linear(512, __C.WREC_DIM),
-            nn.ReLU(),
-            nn.Linear(__C.WREC_DIM, 3)
-        )
-
-        self.clip_router_res = nn.Sequential(
-            nn.Linear(512, __C.WRES_DIM),
-            nn.ReLU(),
-            nn.Linear(__C.WRES_DIM, 3)
-        )
-
-        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 2)
-        self.linear_router_res = nn.Linear(__C.WREC_DIM, 2)
+        self.linear_router_rec = nn.Linear(__C.WREC_DIM, 3)
+        self.linear_router_res = nn.Linear(__C.WREC_DIM, 3)
 
         self.class_num = __C.CLASS_NUM
         self.pixel_mean = torch.tensor(__C.MEAN).view(-1, 1, 1)
@@ -219,79 +203,6 @@ class Net(nn.Module):
         position_embeddings = self.pos_encoder(scaled_bbox)
         return position_embeddings
 
-    def get_clip_features(self, raw_texts, device):
-        # images_unnorm_224: [B,3,224,224] range [0,1] sau khi reverse_normalization
-        # raw_texts: list[str]
-
-        # Text - dùng tokenizer riêng, không dùng processor chung
-        text_inputs = self.clip_processor.tokenizer(
-            raw_texts, padding=True, truncation=True, max_length=77, return_tensors="pt"
-        )
-        text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
-
-        with torch.inference_mode():
-            # Dùng text_model và vision_model cho ổn định mọi version transformers
-            txt_out = self.clip_model.text_model(**text_inputs)
-            text_emb = txt_out.pooler_output  # [B,512]
-
-        text_emb = text_emb / \
-            text_emb.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        return text_emb
-
-    def get_region_clip_loss(self, x_new, text_emb_clip, temperature=0.07):
-        """
-        InfoNCE between selected visual anchors and CLIP text embeddings.
-
-        x_new:
-            [B, N, HIDDEN_SIZE]
-        text_emb_clip:
-            [B, 512]
-        """
-        # Project WeakMCN anchor features into CLIP space
-        visual_emb = self.clip_align_proj(x_new)       # [B, N, 512]
-        visual_emb = F.normalize(visual_emb, dim=-1)
-
-        text_emb = F.normalize(text_emb_clip, dim=-1)  # [B, 512]
-
-        # Aggregate selected anchors.
-        # Soft attention is preferable to simple mean because
-        # only some anchors may correspond to the expression.
-        anchor_score = torch.matmul(
-            visual_emb,
-            text_emb.unsqueeze(-1)
-        ).squeeze(-1)                                  # [B, N]
-        anchor_weight = F.softmax(
-            anchor_score / temperature,
-            dim=-1
-        )
-
-        region_emb = torch.sum(
-            visual_emb * anchor_weight.unsqueeze(-1),
-            dim=1
-        )                                               # [B, 512]
-        region_emb = F.normalize(region_emb, dim=-1)
-
-        # Image -> Text similarity
-        logits_i2t = torch.matmul(
-            region_emb,
-            text_emb.t()
-        ) / temperature                                 # [B, B]
-
-        # Text -> Image similarity
-        logits_t2i = logits_i2t.t()                     # [B, B]
-
-        labels = torch.arange(
-            region_emb.size(0),
-            device=region_emb.device
-        )
-
-        loss_i2t = F.cross_entropy(logits_i2t, labels)
-        loss_t2i = F.cross_entropy(logits_t2i, labels)
-
-        loss_clip = 0.5 * (loss_i2t + loss_t2i)
-
-        return loss_clip
-
     def forward(self, x, y, box_gt=None, mask_gt=None, info_iter=None, gpu_tracker=None, epoch=None, raw_texts=None):
         # Vision and Language Encoding
         with torch.no_grad():
@@ -306,7 +217,14 @@ class Net(nn.Module):
             sam_feature = self.efficientsam.get_image_embeddings(
                 resized_image_feature_sam).to(x.device)
 
-            clip_txt_emb = self.get_clip_features(raw_texts, x.device)
+            x_unnorm = self.reverse_normalization(x)
+            
+            resized_for_clip_224 = F.interpolate(x_unnorm, size=(
+                224, 224), mode='bilinear', align_corners=False)
+
+            clip_outputs = self.clip_model(resized_for_clip_224)
+            # Shape: [B, 50, 768] (1 CLS + 49 Patch Tokens)
+            clip_feature = clip_outputs.last_hidden_state.to(x.device)
 
         y_ = self.lang_encoder(y)
 
@@ -316,16 +234,10 @@ class Net(nn.Module):
         l_new, m_new, s_new = self.multi_scale_manner(x_input)
 
         # Dynamic routing
-        # rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(
-        #     0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
-        # res_feature = F.adaptive_avg_pool2d(l_new, (1, 1)).permute(
-        #     0, 2, 3, 1).squeeze(1)  # (64, 1,1024)
-        # 1. Biến đổi rec_feature & res_feature thành dạng 2D [B, WREC_DIM]
-        rec_feature = F.adaptive_avg_pool2d(
-            s_new, (1, 1)).flatten(1)  # Shape: [B, WREC_DIM]
-        res_feature = F.adaptive_avg_pool2d(
-            l_new, (1, 1)).flatten(1)  # Shape: [B, WRES_DIM]
-
+        rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(
+            0, 2, 3, 1).squeeze(1)  # (B, 1, WREC_DIM)
+        res_feature = F.adaptive_avg_pool2d(l_new, (1, 1)).permute(
+            0, 2, 3, 1).squeeze(1)  # (B, 1, WREC_DIM)
 
         # load dino model
         dino_feature = dino_feature[:, 1:, :]
@@ -349,13 +261,33 @@ class Net(nn.Module):
         sam_feature_res = F.interpolate(sam_feature_res, size=(
             52, 52), mode='bilinear', align_corners=False)
 
+        # =========================================================
+        # 4. BỔ SUNG: Xử lý CLIP Feature map
+        # =========================================================
+        # Bỏ CLS token -> còn 49 patch tokens [B, 49, 768]
+        clip_feature = clip_feature[:, 1:, :]
+        clip_feature = clip_feature.transpose(1, 2).contiguous().view(
+            # Reshape về [B, 768, 7, 7]
+            clip_feature.size(0), clip_feature.size(2), 7, 7)
+
+        clip_feature_rec = F.interpolate(clip_feature, size=(
+            13, 13), mode='bilinear', align_corners=False)
+        clip_feature_res = F.interpolate(clip_feature, size=(
+            52, 52), mode='bilinear', align_corners=False)
+
+        clip_feature_rec = self.linear_clip_rec(
+            clip_feature_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        clip_feature_res = self.linear_clip_res(
+            clip_feature_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
         # Calculate the probability distribution of router_logits
         router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
         router_logits = torch.softmax(router_logits, dim=-1)
         # # --- ROUTING CHO REC (DETECTION) ---
         s_new = s_new + dino_feature_rec * \
             router_logits[:, 0][:, None, None, None] + \
-            sam_feature_rec * router_logits[:, 1][:, None, None, None]
+            sam_feature_rec * router_logits[:, 1][:, None, None, None] + \
+            clip_feature_rec * router_logits[:, 2][:, None, None, None]
         # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
 
         # Calculate the probability distribution of router_logits
@@ -364,7 +296,8 @@ class Net(nn.Module):
         # --- ROUTING CHO RES (SEGMENTATION) ---
         l_new = l_new + dino_feature_res * \
             router_logits[:, 0][:, None, None, None] + \
-            sam_feature_res * router_logits[:, 1][:, None, None, None]
+            sam_feature_res * router_logits[:, 1][:, None, None, None] + \
+            clip_feature_res * router_logits[:, 2][:, None, None, None]
         # l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
 
         x_ = [s_new, m_new, l_new]
@@ -415,9 +348,7 @@ class Net(nn.Module):
             predict_masks = self.ensure_float32(predict_masks)
             loss_seg = self.seg_head(
                 seg_emb, box_gt, predict_masks, pred_boxes, epoch)
-            # --- LOSS CLIP MỚI ---
-            loss_clip = self.get_region_clip_loss(x_new, clip_txt_emb)
-            return loss_det, loss_seg, loss_clip
+            return loss_det, loss_seg
         else:
             predictions_s = self.head(x_new, y_new)
             predictions_list = [predictions_s]
