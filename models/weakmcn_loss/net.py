@@ -108,6 +108,19 @@ class Net(nn.Module):
 
         self.pos_encoder = PositionEmbeddingSine()
 
+        self.linear_decoder = nn.Sequential(
+            nn.Linear(__C.WREC_DIM, __C.WREC_DIM),
+            nn.ReLU(),
+            nn.Linear(__C.WREC_DIM, 512)
+        )
+
+        self.projector_vis = nn.Sequential(
+            nn.Linear(__C.WREC_DIM, 128),
+        )
+        self.projector_txt = nn.Sequential(
+            nn.Linear(512, 128)
+        )
+
         if __C.VIS_FREEZE:
             self.frozen(self.visual_encoder)
             self.frozen(self.efficientsam)
@@ -218,20 +231,20 @@ class Net(nn.Module):
                 resized_image_feature_sam).to(x.device)
 
             x_unnorm = self.reverse_normalization(x)
-            
+
             resized_for_clip_224 = F.interpolate(x_unnorm, size=(
                 224, 224), mode='bilinear', align_corners=False)
 
             clip_outputs = self.clip_model(resized_for_clip_224)
             # Shape: [B, 50, 768] (1 CLS + 49 Patch Tokens)
             clip_feature = clip_outputs.last_hidden_state.to(x.device)
-
         y_ = self.lang_encoder(y)
 
         # Vision Multi Scale Fusion
         s, m, l = x_
         x_input = [l, m, s]
         l_new, m_new, s_new = self.multi_scale_manner(x_input)
+        B = s_new.size(0)  # hoặc x.size(0)
 
         # Dynamic routing
         rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(
@@ -267,38 +280,71 @@ class Net(nn.Module):
         # Bỏ CLS token -> còn 49 patch tokens [B, 49, 768]
         clip_feature = clip_feature[:, 1:, :]
         clip_feature = clip_feature.transpose(1, 2).contiguous().view(
-            # Reshape về [B, 768, 7, 7]
             clip_feature.size(0), clip_feature.size(2), 7, 7)
 
-        clip_feature_rec = F.interpolate(clip_feature, size=(
+        clip_feature_rec = self.linear_clip_rec(
+            clip_feature.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        clip_feature_res = self.linear_clip_res(
+            clip_feature.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+        clip_feature_rec = F.interpolate(clip_feature_rec, size=(
             13, 13), mode='bilinear', align_corners=False)
-        clip_feature_res = F.interpolate(clip_feature, size=(
+        clip_feature_res = F.interpolate(clip_feature_res, size=(
             52, 52), mode='bilinear', align_corners=False)
 
-        clip_feature_rec = self.linear_clip_rec(
-            clip_feature_rec.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        clip_feature_res = self.linear_clip_res(
-            clip_feature_res.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        clip_feature_rec = F.layer_norm(clip_feature_rec.permute(
+            0, 2, 3, 1), [512]).permute(0, 3, 1, 2)
 
         # Calculate the probability distribution of router_logits
-        router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
-        router_logits = torch.softmax(router_logits, dim=-1)
+        # router_logits = self.linear_router_rec(rec_feature.detach()).squeeze(1)
+        # router_logits = torch.softmax(router_logits, dim=-1)
         # # --- ROUTING CHO REC (DETECTION) ---
-        s_new = s_new + dino_feature_rec * \
-            router_logits[:, 0][:, None, None, None] + \
-            sam_feature_rec * router_logits[:, 1][:, None, None, None] + \
-            clip_feature_rec * router_logits[:, 2][:, None, None, None]
-        # s_new = s_new * router_logits[:, 0][:, None, None, None] + dino_feature_rec * router_logits[:, 1][:, None, None, None] + sam_feature_rec * router_logits[:, 2][:, None, None, None]
+        # s_new = s_new + dino_feature_rec * \
+        #     router_logits[:, 0][:, None, None, None] + \
+        #     sam_feature_rec * router_logits[:, 1][:, None, None, None] + \
+        #     clip_feature_rec * router_logits[:, 2][:, None, None, None]
 
-        # Calculate the probability distribution of router_logits
-        router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
-        router_logits = torch.softmax(router_logits, dim=-1)
-        # --- ROUTING CHO RES (SEGMENTATION) ---
-        l_new = l_new + dino_feature_res * \
-            router_logits[:, 0][:, None, None, None] + \
-            sam_feature_res * router_logits[:, 1][:, None, None, None] + \
-            clip_feature_res * router_logits[:, 2][:, None, None, None]
-        # l_new = l_new * router_logits[:, 0][:, None, None, None] + dino_feature_res * router_logits[:, 1][:, None, None, None] + sam_feature_res * router_logits[:, 2][:, None, None, None]
+        # # Calculate the probability distribution of router_logits
+        # router_logits = self.linear_router_res(res_feature.detach()).squeeze(1)
+        # router_logits = torch.softmax(router_logits, dim=-1)
+        # # --- ROUTING CHO RES (SEGMENTATION) ---
+        # l_new = l_new + dino_feature_res * \
+        #     router_logits[:, 0][:, None, None, None] + \
+        #     sam_feature_res * router_logits[:, 1][:, None, None, None] + \
+        #     clip_feature_res * router_logits[:, 2][:, None, None, None]
+
+        logits_rec = self.linear_router_rec(rec_feature.detach())
+        logits_res = self.linear_router_res(res_feature.detach())
+
+        # temperature 0.7 cho nó sharp
+        prob_rec = torch.softmax(logits_rec / 0.7, dim=-1)
+        prob_res = torch.softmax(logits_res / 0.7, dim=-1)
+
+        # top-2 như ý tưởng net 2
+        top2_prob_rec, top2_idx_rec = torch.topk(prob_rec, k=2, dim=1)
+        top2_prob_rec = top2_prob_rec / top2_prob_rec.sum(dim=1, keepdim=True)
+        experts_rec = torch.stack(
+            [dino_feature_rec, sam_feature_rec, clip_feature_rec], dim=1)  # [B,3,C,H,W]
+        s_new = s_new.clone()
+        for k in range(2):
+            idx = top2_idx_rec[:, k]
+            w = top2_prob_rec[:, k][:, None, None, None]
+            s_new = s_new + experts_rec[torch.arange(B), idx] * w
+
+        # top-2 như ý tưởng net 2
+        top2_prob_res, top2_idx_res = torch.topk(prob_res, k=2, dim=1)
+        top2_prob_res = top2_prob_res / top2_prob_res.sum(dim=1, keepdim=True)
+        experts_res = torch.stack(
+            [dino_feature_res, sam_feature_res, clip_feature_res], dim=1)  # [B,3,C,H,W]
+        l_new = l_new.clone()
+        for k in range(2):
+            idx = top2_idx_res[:, k]
+            w = top2_prob_res[:, k][:, None, None, None]
+            l_new = l_new + experts_res[torch.arange(B), idx] * w
+
+
+        sparse_loss = (prob_rec.mean(0) * prob_rec.mean(0)).sum() * 3 + \
+              (prob_res.mean(0) * prob_res.mean(0)).sum() * 3
 
         x_ = [s_new, m_new, l_new]
         # Anchor Selection
@@ -320,6 +366,19 @@ class Net(nn.Module):
         i_new = i_new.masked_select(
             torch.zeros(bs, gridnum).to(i_new.device).scatter(1, indices, 1).
             bool().unsqueeze(2).expand(bs, gridnum, ch)).contiguous().view(bs, selnum, ch)
+
+
+        # a) Text Reconstruction - ép visual phải nhớ được chữ
+        recon_text = self.linear_decoder(i_new)  # [B, sel, 512]
+        recon_loss = F.mse_loss(recon_text.mean(dim=1), y_['flat_lang_feat'].detach())
+
+        # b) Visual-Text Contrastive - code net 2 của bạn đang contrast yolo vs expert,
+        # sửa lại thành vis vs text mới tăng semantic
+        z_vis = F.normalize(self.projector_vis(i_new.mean(dim=1)), dim=1)
+        z_txt = F.normalize(self.projector_txt(y_['flat_lang_feat']), dim=1)
+        logits = z_vis @ z_txt.T / 0.5  # temperature 0.5
+        labels = torch.arange(B).to(x.device)
+        loss_contrastive = F.cross_entropy(logits, labels)
 
         # Anchor-based Contrastive Learning
         x_new = self.linear_vs(i_new)
@@ -348,7 +407,8 @@ class Net(nn.Module):
             predict_masks = self.ensure_float32(predict_masks)
             loss_seg = self.seg_head(
                 seg_emb, box_gt, predict_masks, pred_boxes, epoch)
-            return loss_det, loss_seg
+            total_aux = recon_loss + loss_contrastive + 0.01 * sparse_loss
+            return loss_det + total_aux, loss_seg
         else:
             predictions_s = self.head(x_new, y_new)
             predictions_list = [predictions_s]
