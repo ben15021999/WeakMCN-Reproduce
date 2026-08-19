@@ -115,12 +115,11 @@ class Net(nn.Module):
             nn.Linear(__C.WREC_DIM, 512)
         )
 
-        self.projector_vis = nn.Sequential(
-            nn.Linear(__C.WREC_DIM, 128),
-        )
-        self.projector_txt = nn.Sequential(
-            nn.Linear(512, 128)
-        )
+        # mean/std của CLIP
+        self.clip_mean = torch.tensor(
+            [0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
+        self.clip_std = torch.tensor(
+            [0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
 
         if __C.VIS_FREEZE:
             self.frozen(self.visual_encoder)
@@ -235,17 +234,22 @@ class Net(nn.Module):
 
             resized_for_clip_224 = F.interpolate(x_unnorm, size=(
                 224, 224), mode='bilinear', align_corners=False)
+            clip_mean = self.clip_mean.to(resized_for_clip_224.device)
+            clip_std = self.clip_std.to(resized_for_clip_224.device)
 
-            clip_outputs = self.clip_model(resized_for_clip_224)
-            # Shape: [B, 50, 768] (1 CLS + 49 Patch Tokens)
-            clip_feature = clip_outputs.last_hidden_state.to(x.device)
+            clip_input = (resized_for_clip_224 - clip_mean) / clip_std
+            clip_outputs = self.clip_model(clip_input)
+            clip_feature = clip_outputs.last_hidden_state
+
+            # clip_outputs = self.clip_model(resized_for_clip_224)
+            # # Shape: [B, 50, 768] (1 CLS + 49 Patch Tokens)
+            # clip_feature = clip_outputs.last_hidden_state.to(x.device)
         y_ = self.lang_encoder(y)
 
         # Vision Multi Scale Fusion
         s, m, l = x_
         x_input = [l, m, s]
         l_new, m_new, s_new = self.multi_scale_manner(x_input)
-        B = s_new.size(0)  # hoặc x.size(0)
 
         # Dynamic routing
         rec_feature = F.adaptive_avg_pool2d(s_new, (1, 1)).permute(
@@ -344,11 +348,11 @@ class Net(nn.Module):
 
         # b) Visual-Text Contrastive - code net 2 của bạn đang contrast yolo vs expert,
         # sửa lại thành vis vs text mới tăng semantic
-        z_vis = F.normalize(self.projector_vis(i_new.mean(dim=1)), dim=1)
-        z_txt = F.normalize(self.projector_txt(y_['flat_lang_feat']), dim=1)
-        logits = z_vis @ z_txt.T / 0.5  # temperature 0.5
-        labels = torch.arange(B).to(x.device)
-        loss_contrastive = F.cross_entropy(logits, labels)
+        # z_vis = F.normalize(self.projector_vis(i_new.mean(dim=1)), dim=1)
+        # z_txt = F.normalize(self.projector_txt(y_['flat_lang_feat']), dim=1)
+        # logits = z_vis @ z_txt.T / 0.5  # temperature 0.5
+        # labels = torch.arange(B).to(x.device)
+        # loss_contrastive = F.cross_entropy(logits, labels)
 
         # Anchor-based Contrastive Learning
         x_new = self.linear_vs(i_new)
@@ -377,8 +381,7 @@ class Net(nn.Module):
             predict_masks = self.ensure_float32(predict_masks)
             loss_seg = self.seg_head(
                 seg_emb, box_gt, predict_masks, pred_boxes, epoch)
-            total_aux = recon_loss + loss_contrastive
-            return loss_det + total_aux, loss_seg
+            return loss_det + recon_loss, loss_seg
         else:
             predictions_s = self.head(x_new, y_new)
             predictions_list = [predictions_s]
