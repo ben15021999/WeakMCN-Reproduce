@@ -62,106 +62,71 @@ class LSTM_SA(nn.Module):
         }
 
 
-class CLIP_SA(nn.Module):
+class BERT_SA(nn.Module):
+    def __init__(self, __C):
+        super(BERT_SA, self).__init__()
+        # Khởi tạo backbone BERT
+        self.bert = AutoModel.from_pretrained('bert-base-uncased')
 
-    def __init__(self, __C, pretrained_emb=None, token_size=None, dropout=0.0):
-        super(CLIP_SA, self).__init__()
+        # BERT base có hidden_size = 768
+        bert_out_dim = self.bert.config.hidden_size
 
-        self.__C = __C
+        # Nếu HIDDEN_SIZE của network khác 768, chiếu về HIDDEN_SIZE
+        if bert_out_dim != __C.HIDDEN_SIZE:
+            self.proj = nn.Linear(bert_out_dim, __C.HIDDEN_SIZE)
+        else:
+            self.proj = nn.Identity()
 
-        # =========================
-        # CLIP
-        # =========================
-        self.clip_name = __C.CLIP_MODEL
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.clip_name
-        )
-
-        clip_config = CLIPTextConfig.from_pretrained(self.clip_name,
-                                                     attention_dropout=dropout)
-
-        self.text_encoder = CLIPTP.from_pretrained(
-            self.clip_name,
-            config=clip_config
-        )
-
-        self.clip_dim = self.text_encoder.config.hidden_size
-
-        # =========================
-        # projection
-        # =========================
-        self.proj = nn.Linear(
-            self.clip_dim,
-            __C.HIDDEN_SIZE
-        )
-
-        # =========================
-        # optional SA
-        # =========================
-        self.sa_list = nn.ModuleList(
-            [SA(__C) for _ in range(__C.N_SA)]
-        )
-
-        # self.gru = nn.GRU(input_size=self.clip_dim, hidden_size=self.clip_dim,
-        #                   num_layers=1, batch_first=True, bidirectional=True)
-
+        self.sa_list = nn.ModuleList([SA(__C) for _ in range(__C.N_SA)])
         self.att_flat = AttFlat(__C)
 
-        # freeze clip encoder
+        # Đóng băng BERT nếu được cấu hình
         if __C.EMBED_FREEZE:
-            self.freeze_module(self.text_encoder)
+            self.frozen(self.bert)
 
-    def freeze_module(self, module):
+    def frozen(self, module):
         module.eval()
-        if getattr(module, 'module', False):
-            for child in module.module():
-                for param in child.parameters():
-                    param.requires_grad = False
-        else:
-            for param in module.parameters():
-                param.requires_grad = False
+        for param in module.parameters():
+            param.requires_grad = False
 
-    def forward(self, inputs):
+    def forward(self, y):
+        input_ids = y['input_ids']
+        attention_mask = y['attention_mask']
+        # 1. Trích xuất đặc trưng từ BERT
+        bert_output = self.bert(input_ids=input_ids,
+                                attention_mask=attention_mask)
+        # last_hidden_state có kích thước: (batch_size, seq_len, 768)
+        lang_feat = bert_output.last_hidden_state
 
-        with torch.no_grad():
-            outputs = self.text_encoder(**inputs)
-
-        lang_feat = outputs.last_hidden_state
+        # 2. Chiếu đặc trưng về kích thước HIDDEN_SIZE nếu cần
         lang_feat = self.proj(lang_feat)
 
-        # lang_feat_mask = inputs["attention_mask"]
-        # lang_feat_mask = make_mask(ques_ix.unsqueeze(2))
-        lang_feat_mask = ~inputs["attention_mask"].bool().unsqueeze(1).unsqueeze(2)
+        # 3. Tạo mask cho khối Self-Attention / AttFlat
+        # Chuyển attention_mask (batch, seq_len) -> (batch, 1, 1, seq_len) hoặc tương đương hàm make_mask
+        lang_feat_mask = make_mask(input_ids.unsqueeze(2))
 
+        # 4. Đưa qua các lớp SA và AttFlat hiện tại
         for sa in self.sa_list:
             lang_feat = sa(lang_feat, lang_feat_mask)
 
-        flat_lang_feat = self.att_flat(
-            lang_feat,
-            lang_feat_mask
-        )
+        flat_lang_feat = self.att_flat(lang_feat, lang_feat_mask)
 
-        # flat_lang_feat = outputs.text_embeds
-
-        # return {
-        #     'flat_lang_feat': flat_lang_feat,
-        #     'lang_feat': lang_feat,
-        #     'lang_feat_mask': inputs["attention_mask"]
-        # }
         return {
-            "flat_lang_feat": flat_lang_feat,
-            "lang_feat": lang_feat,
-            "lang_feat_mask": lang_feat_mask
+            'flat_lang_feat': flat_lang_feat,
+            'lang_feat': lang_feat,
+            'lang_feat_mask': lang_feat_mask
         }
 
 
 backbone_dict = {
     'lstm': LSTM_SA,
-    'clip': CLIP_SA,
+    'bert': BERT_SA,
 }
 
 
-def language_encoder(__C, pretrained_emb, token_size):
-    lang_enc = backbone_dict[__C.LANG_ENC](__C, pretrained_emb, token_size)
+def language_encoder(__C, pretrained_emb=None, token_size=None):
+    if __C.LANG_ENC == 'lstm':
+        lang_enc = backbone_dict[__C.LANG_ENC](__C, pretrained_emb, token_size)
+    else:
+        lang_enc = backbone_dict[__C.LANG_ENC](__C)
     return lang_enc
