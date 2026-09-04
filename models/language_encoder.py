@@ -71,11 +71,14 @@ class BERT_SA(nn.Module):
         # BERT base có hidden_size = 768
         bert_out_dim = self.bert.config.hidden_size
 
-        # Nếu HIDDEN_SIZE của network khác 768, chiếu về HIDDEN_SIZE
-        if bert_out_dim != __C.HIDDEN_SIZE:
-            self.proj = nn.Linear(bert_out_dim, __C.HIDDEN_SIZE)
-        else:
-            self.proj = nn.Identity()
+        # 2. Projection / Adapter Layer (Luôn được train kể cả khi Freeze BERT)
+        # Lớp này giúp biến đổi không gian văn bản BERT về không gian Visual của mô hình
+        # Dù cùng 768-dim, việc có 1 lớp Linear trainable sẽ giúp học thích nghi tốt hơn nhiều
+        self.proj = nn.Sequential(
+            nn.Linear(bert_out_dim, __C.HIDDEN_SIZE),
+            nn.GELU(),
+            nn.Dropout(__C.DROPOUT_R)
+        )
 
         self.sa_list = nn.ModuleList([SA(__C) for _ in range(__C.N_SA)])
         self.att_flat = AttFlat(__C)
@@ -86,15 +89,21 @@ class BERT_SA(nn.Module):
 
     def frozen(self, module):
         module.eval()
-        for param in module.parameters():
-            param.requires_grad = False
+        if getattr(module, 'module', False):
+            for child in module.module():
+                for param in child.parameters():
+                    param.requires_grad = False
+        else:
+            for param in module.parameters():
+                param.requires_grad = False
 
     def forward(self, y):
         input_ids = y['input_ids']
         attention_mask = y['attention_mask']
         # 1. Trích xuất đặc trưng từ BERT
-        bert_output = self.bert(input_ids=input_ids,
-                                attention_mask=attention_mask)
+        with torch.no_grad():
+            bert_output = self.bert(input_ids=input_ids,
+                                    attention_mask=attention_mask)
         # last_hidden_state có kích thước: (batch_size, seq_len, 768)
         lang_feat = bert_output.last_hidden_state
 
@@ -103,7 +112,7 @@ class BERT_SA(nn.Module):
 
         # 3. Tạo mask cho khối Self-Attention / AttFlat
         # Chuyển attention_mask (batch, seq_len) -> (batch, 1, 1, seq_len) hoặc tương đương hàm make_mask
-        lang_feat_mask = make_mask(input_ids.unsqueeze(2))
+        lang_feat_mask = attention_mask.unsqueeze(1).unsqueeze(2)
 
         # 4. Đưa qua các lớp SA và AttFlat hiện tại
         for sa in self.sa_list:

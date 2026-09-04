@@ -57,6 +57,8 @@ class EMA(object):
                 continue
             if "clip" in name:
                 continue
+            if "bert" in name:
+                continue
             if self.buffer_ema:
                 self.shadow[name].copy_(
                     decay * self.shadow[name]

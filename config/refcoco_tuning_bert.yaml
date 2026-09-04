@@ -23,7 +23,7 @@ MODEL:
 TRAIN:
   GPU: [0]
   BATCH_SIZE: 30 # total batch size on a single node if multiprocessing_distributed else batch size on one gpu
-  NUM_WORKER: 8 # same as BATCH_SIZE
+  NUM_WORKER: 4 # same as BATCH_SIZE
   LR: 0.0001
   EPOCHS: 25
   LR_DECAY_R: 0.2
@@ -72,24 +72,24 @@ DATA:
 
   ANN_PATH:
     {
-      'refcoco': './data/anns/refcoco.json',
-      'refcoco+': './data/anns/refcoco+.json',
-      'refcocog': './data/anns/refcocog.json',
-      'referit': './data/anns/refclef.json'
+      'refcoco': '/kaggle/working/WeakMCN-Reproduce/data/anns/refcoco.json',
+      'refcoco+': '/kaggle/working/WeakMCN-Reproduce/data/anns/refcoco+.json',
+      'refcocog': '/kaggle/working/WeakMCN-Reproduce/data/anns/refcocog.json',
+      'referit': '/kaggle/working/WeakMCN-Reproduce/data/anns/refclef.json'
     }
 
   IMAGE_PATH:
     {
-      'refcoco': '/kaggle/input/refcoco/train2014',
-      'refcoco+': '/kaggle/input/refcoco/train2014',
-      'refcocog': '/kaggle/input/refcoco/train2014',
-      'referit': '/kaggle/input/refcoco/train2014'
+      'refcoco': '/kaggle/input/datasets/pokabu1999/refcoco/train2014',
+      'refcoco+': '/kaggle/input/datasets/pokabu1999/refcoco/train2014',
+      'refcocog': '/kaggle/input/datasets/pokabu1999/refcoco/train2014',
+      'referit': '/kaggle/input/datasets/pokabu1999/refcoco/train2014'
     }
 
   MASK_PATH:
     {
-      'refcoco': './data/masks/refcoco',
-      'refcoco+': './data/masks/refcoco+',
-      'refcocog': './data/masks/refcocog',
+      'refcoco': '/kaggle/working/WeakMCN-Reproduce/data/masks/refcoco',
+      'refcoco+': '/kaggle/working/WeakMCN-Reproduce/data/masks/refcoco+',
+      'refcocog': '/kaggle/working/WeakMCN-Reproduce/data/masks/refcocog',
       'referit': './data/masks/refclef'
     }
